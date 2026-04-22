@@ -1141,7 +1141,7 @@ impl GooseAcpAgent {
                     let info = client.get_info().cloned();
                     agent
                         .extension_manager
-                        .add_client("developer".into(), config, client, info, None)
+                        .add_client("developer".into(), config, client, info, None, None)
                         .await;
                 }
 

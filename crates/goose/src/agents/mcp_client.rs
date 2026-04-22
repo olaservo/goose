@@ -101,6 +101,15 @@ pub trait McpClientTrait: Send + Sync {
         None
     }
 
+    /// Optional per-turn dynamic addition to the extension's instructions.
+    /// Returned text is appended to the static `InitializeResult.instructions`
+    /// when `ExtensionManager::get_extensions_info` assembles the system
+    /// prompt. Called on every reply, so implementations MUST NOT do network
+    /// I/O inline — read from caches instead. Default: no dynamic contribution.
+    async fn get_dynamic_instructions(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
     async fn update_working_dir(&self, _new_dir: PathBuf) -> Result<(), Error> {
         Ok(())
     }
@@ -355,6 +364,16 @@ impl ClientHandler for GooseClient {
                 ui_extension_settings,
             );
         }
+
+        // Advertise host-side support for the skills-over-MCP SEP
+        // (`io.modelcontextprotocol/skills`). The SEP does not require
+        // clients to declare this; we do so informationally so servers
+        // can branch on "client understands skills" if they ever need
+        // to. Empty object per SEP §Capability Declaration.
+        extensions.insert(
+            crate::skills::mcp_client::SKILLS_EXTENSION_ID.to_string(),
+            JsonObject::new(),
+        );
 
         InitializeRequestParams::new(
             ClientCapabilities::builder()
@@ -998,6 +1017,28 @@ mod tests {
             info.capabilities.roots.is_some(),
             "client should advertise roots capability"
         );
+    }
+
+    #[test]
+    fn test_client_capabilities_advertise_skills_extension() {
+        // Both CLI and Desktop platforms should advertise the skills SEP
+        // extension — it's a host-level capability, not platform-specific.
+        for platform in [GoosePlatform::GooseCli, GoosePlatform::GooseDesktop] {
+            let client = new_client(platform.clone());
+            let info = ClientHandler::get_info(&client);
+            let extensions = info
+                .capabilities
+                .extensions
+                .as_ref()
+                .expect("client capabilities should include an extensions map");
+            assert!(
+                extensions.contains_key(
+                    crate::skills::mcp_client::SKILLS_EXTENSION_ID
+                ),
+                "client ({:?}) should advertise io.modelcontextprotocol/skills",
+                platform
+            );
+        }
     }
 
     #[test]
