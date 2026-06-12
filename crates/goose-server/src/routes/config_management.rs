@@ -200,6 +200,16 @@ pub struct SlashCommand {
     /// (e.g. "github"). `None` for filesystem skills and non-skill commands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Attribution grade for an MCP skill, from the `mcp-ext-interceptors`
+    /// chain: `compliant_with_upstream_attribution` | `compliant` | `partial`
+    /// | `non-compliant`. `None` for non-skill commands and skills not yet
+    /// graded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compliance_status: Option<String>,
+    /// One-line credit summary for an MCP skill (author · license · sources),
+    /// or `None` when the skill declares nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribution_summary: Option<String>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct SlashCommandsResponse {
@@ -1044,6 +1054,8 @@ pub async fn get_slash_commands(
             help: command.recipe_path.clone(),
             command_type: CommandType::Recipe,
             origin: None,
+            compliance_status: None,
+            attribution_summary: None,
         })
         .collect();
 
@@ -1053,6 +1065,8 @@ pub async fn get_slash_commands(
             help: cmd_def.description.to_string(),
             command_type: CommandType::Builtin,
             origin: None,
+            compliance_status: None,
+            attribution_summary: None,
         });
     }
 
@@ -1063,6 +1077,8 @@ pub async fn get_slash_commands(
             help: source.description,
             command_type: CommandType::Skill,
             origin: None,
+            compliance_status: None,
+            attribution_summary: None,
         });
     }
 
@@ -1082,6 +1098,8 @@ pub async fn get_slash_commands(
                 help: source.description,
                 command_type: CommandType::Agent,
                 origin: None,
+                compliance_status: None,
+                attribution_summary: None,
             });
         }
     }
@@ -1089,17 +1107,54 @@ pub async fn get_slash_commands(
     if let Some(session_id) = query.session_id.as_deref() {
         if let Ok(agent) = state.get_agent(session_id.to_string()).await {
             for entry in agent.extension_manager.aggregated_mcp_skills().await {
+                let attribution =
+                    mcp_skill_attribution(&agent.extension_manager, session_id, &entry).await;
                 commands.push(SlashCommand {
                     command: entry.name,
                     help: entry.description,
                     command_type: CommandType::Skill,
                     origin: Some(entry.server),
+                    compliance_status: attribution.as_ref().map(|a| a.compliance.clone()),
+                    attribution_summary: attribution
+                        .as_ref()
+                        .filter(|a| !a.summary.is_empty())
+                        .map(|a| a.summary.clone()),
                 });
             }
         }
     }
 
     Ok(Json(SlashCommandsResponse { commands }))
+}
+
+/// Resolves the attribution grade for an MCP skill, reading its `SKILL.md` body
+/// once and memoizing by URI (see [`goose::skills::attribution`]). Best-effort:
+/// a server that can't be read leaves the skill ungraded (no badge) rather than
+/// failing the whole listing.
+async fn mcp_skill_attribution(
+    extension_manager: &goose::agents::extension_manager::ExtensionManager,
+    session_id: &str,
+    entry: &goose::skills::mcp_client::McpSkillEntry,
+) -> Option<goose::skills::attribution::SkillAttribution> {
+    if let Some(cached) = goose::skills::attribution::cached(&entry.url) {
+        return Some(cached);
+    }
+    let result = extension_manager
+        .read_resource(
+            session_id,
+            &entry.url,
+            &entry.server,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .ok()?;
+    let body = result.contents.into_iter().find_map(|c| match c {
+        rmcp::model::ResourceContents::TextResourceContents { text, .. } => Some(text),
+        _ => None,
+    })?;
+    let attribution = goose::skills::attribution::grade(&entry.url, &body, session_id).await;
+    goose::skills::attribution::cache_put(&entry.url, attribution.clone());
+    Some(attribution)
 }
 
 #[derive(Serialize, ToSchema)]

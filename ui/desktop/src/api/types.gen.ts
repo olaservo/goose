@@ -1440,8 +1440,20 @@ export type ShareSessionNostrResponse = {
 };
 
 export type SlashCommand = {
+    /**
+     * One-line credit summary for an MCP skill (author · license · sources),
+     * or `None` when the skill declares nothing.
+     */
+    attribution_summary?: string | null;
     command: string;
     command_type: CommandType;
+    /**
+     * Attribution grade for an MCP skill, from the `mcp-ext-interceptors`
+     * chain: `compliant_with_upstream_attribution` | `compliant` | `partial`
+     * | `non-compliant`. `None` for non-skill commands and skills not yet
+     * graded.
+     */
+    compliance_status?: string | null;
     help: string;
     /**
      * For MCP-sourced skills, the name of the originating MCP extension

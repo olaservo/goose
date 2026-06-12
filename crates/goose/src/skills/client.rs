@@ -1,25 +1,19 @@
+use super::attribution;
 use super::discover_skills;
 use super::mcp_client::{McpSkillEntry, McpSkillTemplate};
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::ToolCallContext;
-use crate::config::Config;
 use async_trait::async_trait;
 use goose_sdk::custom_requests::{SourceEntry, SourceType};
-use mcp_ext_interceptors::{
-    attribution::attribution_validator,
-    chain::Chain,
-    events::RESOURCES_READ,
-    invocation::{InvocationContext, Principal, SystemClock},
-};
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
     ResourceContents, ServerCapabilities, ServerNotification, Tool,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -621,82 +615,39 @@ async fn read_mcp_and_frame(
     }
 }
 
-/// Config key gating SKILL.md attribution enforcement. Off by default: when
-/// unset, MCP skills load exactly as before — every load is still audited via
-/// the chain's `[skill-attribution]` event, but nothing is withheld. When set
-/// true, a SKILL.md that declares **no attribution at all** (no author and no
-/// license, i.e. `complianceLevel: non-compliant`) is withheld from the model.
-/// A `partial` skill — one that credits at least an author or a license — still
-/// loads; the gate enforces attribution, not full provenance.
-const ATTRIBUTION_REQUIRE_KEY: &str = "GOOSE_SKILLS_ATTRIBUTION_REQUIRE";
-
-/// Runs a loaded SKILL.md body through the `mcp-ext-interceptors` attribution
-/// chain — the same in-process mount the standalone demo uses, here at Goose's
-/// real `load_skill` boundary. The chain always emits its audit event. Returns
-/// `Some(error_result)` when enforcement is enabled and the skill grades
-/// `non-compliant` (the body is then withheld instead of returned to the
-/// model), or `None` when the gate is off or the skill declares any attribution.
+/// Runs a loaded SKILL.md body through the shared attribution gate
+/// ([`crate::skills::attribution`]) — the in-process mount at Goose's real
+/// `load_skill` boundary. The grade is always computed (and cached for the UI
+/// status surface); enforcement is gated by `GOOSE_SKILLS_ATTRIBUTION_REQUIRE`.
+/// Returns `Some(error_result)` when enforcement is on and the skill grades
+/// `non-compliant` — credits nothing, covering both a malformed SKILL.md and a
+/// parseable one with an empty attribution block — so the body is withheld
+/// instead of returned to the model. Returns `None` when the gate is off or the
+/// skill declares any attribution (`partial` and above still load).
 async fn enforce_skill_attribution(
     session_id: &str,
     uri: &str,
     body: &str,
 ) -> Option<CallToolResult> {
-    if !Config::global()
-        .get_param::<bool>(ATTRIBUTION_REQUIRE_KEY)
-        .unwrap_or(false)
-    {
+    if !attribution::enforcement_enabled() {
         return None;
     }
 
-    let chain = Chain::new().with(attribution_validator(Arc::new(SystemClock)));
-    let ctx = InvocationContext {
-        principal: Some(Principal {
-            principal_type: "user".to_string(),
-            id: Some(session_id.to_string()),
-            claims: None,
-        }),
-        trace_id: Some(session_id.to_string()),
-        ..Default::default()
-    };
-    let payload = serde_json::json!({
-        "contents": [{ "uri": uri, "text": body }]
-    });
+    let attr = attribution::grade(uri, body, session_id).await;
+    attribution::cache_put(uri, attr.clone());
 
-    let outcome = chain
-        .execute_response(RESOURCES_READ, payload, Some(ctx))
-        .await;
-
-    let record = outcome.results.first();
-    let compliance = record
-        .and_then(|r| r.info.as_ref())
-        .and_then(|i| i.get("complianceLevel"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("non-compliant");
-
-    // Enforce attribution, not mere SEP-2640 well-formedness: withhold only a
-    // skill that credits nothing (no author and no license). This covers both a
-    // malformed SKILL.md and a parseable one with an empty attribution block;
-    // `partial` and above declare some attribution and are allowed through.
-    if compliance != "non-compliant" {
+    if !attr.is_non_compliant() {
         return None;
     }
 
-    let reasons = record
-        .and_then(|r| r.validation.as_ref())
-        .map(|v| {
-            v.messages
-                .iter()
-                .map(|m| m.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        })
-        .unwrap_or_default();
     warn!(
         uri,
-        compliance, "withholding skill: no attribution declared"
+        compliance = %attr.compliance,
+        "withholding skill: no attribution declared"
     );
     Some(CallToolResult::error(vec![Content::text(format!(
-        "Skill '{uri}' was withheld: it declares no attribution ({compliance}). {reasons}"
+        "Skill '{uri}' was withheld: it declares no attribution ({}). {}",
+        attr.compliance, attr.detail
     ))]))
 }
 
@@ -2922,7 +2873,10 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_off_loads_uncredited() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, None::<&str>)]);
+        let _guard = env_lock::lock_env([(
+            crate::skills::attribution::ATTRIBUTION_REQUIRE_KEY,
+            None::<&str>,
+        )]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
         assert!(
@@ -2933,7 +2887,10 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_on_blocks_uncredited() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(
+            crate::skills::attribution::ATTRIBUTION_REQUIRE_KEY,
+            Some("true"),
+        )]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
         let result = result.expect("uncredited skill must be withheld when the gate is on");
@@ -2945,7 +2902,10 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_on_blocks_valid_but_uncredited() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(
+            crate::skills::attribution::ATTRIBUTION_REQUIRE_KEY,
+            Some("true"),
+        )]);
         let result = super::enforce_skill_attribution(
             "s1",
             "skill://x/SKILL.md",
@@ -2960,7 +2920,10 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_on_loads_partial() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(
+            crate::skills::attribution::ATTRIBUTION_REQUIRE_KEY,
+            Some("true"),
+        )]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", PARTIAL_SKILL).await;
         assert!(
@@ -2971,7 +2934,10 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_on_loads_compliant() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(
+            crate::skills::attribution::ATTRIBUTION_REQUIRE_KEY,
+            Some("true"),
+        )]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", COMPLIANT_SKILL).await;
         assert!(

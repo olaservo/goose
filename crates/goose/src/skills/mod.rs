@@ -3,6 +3,7 @@
 //! CRUD lives in `crate::sources`, which generalizes across source types.
 
 mod arguments;
+pub mod attribution;
 mod builtin;
 pub mod client;
 pub mod mcp_client;

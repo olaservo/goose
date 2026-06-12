@@ -64,9 +64,28 @@ interface SkillEntry {
   name: string;
   description: string;
   origin?: string;
+  complianceStatus?: string;
+  attributionSummary?: string;
+}
+
+// Maps a skill's attribution grade (from the mcp-ext-interceptors chain) to a
+// short badge label and color. `null` hides the badge (no grade available).
+function complianceBadge(status?: string): { label: string; className: string } | null {
+  switch (status) {
+    case 'compliant_with_upstream_attribution':
+    case 'compliant':
+      return { label: 'attributed', className: 'bg-green-500/15 text-green-700 dark:text-green-400' };
+    case 'partial':
+      return { label: 'partial', className: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400' };
+    case 'non-compliant':
+      return { label: 'uncredited', className: 'bg-red-500/15 text-red-700 dark:text-red-400' };
+    default:
+      return null;
+  }
 }
 
 function SkillItem({ skill }: { skill: SkillEntry }) {
+  const badge = complianceBadge(skill.complianceStatus);
   return (
     <Card className="py-2 px-4 mb-2 bg-background-primary border-none hover:bg-background-secondary transition-all duration-150">
       <div className="flex justify-between items-center gap-4">
@@ -78,8 +97,24 @@ function SkillItem({ skill }: { skill: SkillEntry }) {
                 MCP · {skill.origin}
               </span>
             ) : null}
+            {badge ? (
+              <span
+                className={`text-xs px-1.5 py-0.5 rounded ${badge.className}`}
+                title={skill.complianceStatus}
+              >
+                {badge.label}
+              </span>
+            ) : null}
           </div>
           <p className="text-text-secondary text-sm line-clamp-2">{skill.description}</p>
+          {skill.attributionSummary ? (
+            <p
+              className="text-xs text-text-secondary/80 mt-1 truncate"
+              title={skill.attributionSummary}
+            >
+              {skill.attributionSummary}
+            </p>
+          ) : null}
         </div>
       </div>
     </Card>
@@ -138,6 +173,8 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
           name: cmd.command,
           description: cmd.help,
           origin: cmd.origin ?? undefined,
+          complianceStatus: cmd.compliance_status ?? undefined,
+          attributionSummary: cmd.attribution_summary ?? undefined,
         }));
       setSkills(skillEntries);
     } catch (err) {

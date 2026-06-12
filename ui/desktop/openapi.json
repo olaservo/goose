@@ -8608,11 +8608,21 @@
           "command_type"
         ],
         "properties": {
+          "attribution_summary": {
+            "type": "string",
+            "description": "One-line credit summary for an MCP skill (author · license · sources),\nor `None` when the skill declares nothing.",
+            "nullable": true
+          },
           "command": {
             "type": "string"
           },
           "command_type": {
             "$ref": "#/components/schemas/CommandType"
+          },
+          "compliance_status": {
+            "type": "string",
+            "description": "Attribution grade for an MCP skill, from the `mcp-ext-interceptors`\nchain: `compliant_with_upstream_attribution` | `compliant` | `partial`\n| `non-compliant`. `None` for non-skill commands and skills not yet\ngraded.",
+            "nullable": true
           },
           "help": {
             "type": "string"
