@@ -622,22 +622,27 @@ async fn read_mcp_and_frame(
 }
 
 /// Config key gating SKILL.md attribution enforcement. Off by default: when
-/// unset, MCP skills load exactly as before. When set true, a SKILL.md that
-/// fails the SEP-2640 attribution check is withheld from the model.
-const ATTRIBUTION_ENFORCE_KEY: &str = "GOOSE_SKILLS_ATTRIBUTION_ENFORCE";
+/// unset, MCP skills load exactly as before — every load is still audited via
+/// the chain's `[skill-attribution]` event, but nothing is withheld. When set
+/// true, a SKILL.md that declares **no attribution at all** (no author and no
+/// license, i.e. `complianceLevel: non-compliant`) is withheld from the model.
+/// A `partial` skill — one that credits at least an author or a license — still
+/// loads; the gate enforces attribution, not full provenance.
+const ATTRIBUTION_REQUIRE_KEY: &str = "GOOSE_SKILLS_ATTRIBUTION_REQUIRE";
 
 /// Runs a loaded SKILL.md body through the `mcp-ext-interceptors` attribution
 /// chain — the same in-process mount the standalone demo uses, here at Goose's
-/// real `load_skill` boundary. Returns `Some(error_result)` when enforcement is
-/// enabled and the skill is non-compliant (the body is then withheld instead of
-/// returned to the model), or `None` when the gate is off or the skill passes.
+/// real `load_skill` boundary. The chain always emits its audit event. Returns
+/// `Some(error_result)` when enforcement is enabled and the skill grades
+/// `non-compliant` (the body is then withheld instead of returned to the
+/// model), or `None` when the gate is off or the skill declares any attribution.
 async fn enforce_skill_attribution(
     session_id: &str,
     uri: &str,
     body: &str,
 ) -> Option<CallToolResult> {
     if !Config::global()
-        .get_param::<bool>(ATTRIBUTION_ENFORCE_KEY)
+        .get_param::<bool>(ATTRIBUTION_REQUIRE_KEY)
         .unwrap_or(false)
     {
         return None;
@@ -660,29 +665,38 @@ async fn enforce_skill_attribution(
     let outcome = chain
         .execute_response(RESOURCES_READ, payload, Some(ctx))
         .await;
-    if outcome.ok() {
-        return None;
-    }
 
-    let compliance = outcome
-        .results
-        .first()
+    let record = outcome.results.first();
+    let compliance = record
         .and_then(|r| r.info.as_ref())
         .and_then(|i| i.get("complianceLevel"))
         .and_then(|c| c.as_str())
         .unwrap_or("non-compliant");
-    let reasons = outcome
-        .aborts
-        .iter()
-        .map(|a| a.reason.as_str())
-        .collect::<Vec<_>>()
-        .join("; ");
+
+    // Enforce attribution, not mere SEP-2640 well-formedness: withhold only a
+    // skill that credits nothing (no author and no license). This covers both a
+    // malformed SKILL.md and a parseable one with an empty attribution block;
+    // `partial` and above declare some attribution and are allowed through.
+    if compliance != "non-compliant" {
+        return None;
+    }
+
+    let reasons = record
+        .and_then(|r| r.validation.as_ref())
+        .map(|v| {
+            v.messages
+                .iter()
+                .map(|m| m.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
+        .unwrap_or_default();
     warn!(
         uri,
-        compliance, "withholding skill: failed attribution check"
+        compliance, "withholding skill: no attribution declared"
     );
     Some(CallToolResult::error(vec![Content::text(format!(
-        "Skill '{uri}' was withheld: it failed the attribution check ({compliance}). {reasons}"
+        "Skill '{uri}' was withheld: it declares no attribution ({compliance}). {reasons}"
     ))]))
 }
 
@@ -2896,11 +2910,19 @@ mod tests {
     // ---------- Skill attribution gate ----------
 
     const COMPLIANT_SKILL: &str = "---\nname: demo\nlicense: CC-BY-4.0\nmetadata:\n  skill_author: Vault-Tec\n  sources:\n    - https://example.com\n  attribution: \"Derived from the example SRD.\"\n---\n# Demo\nbody\n";
+    // Author present but nothing else → `partial` (some attribution declared).
+    const PARTIAL_SKILL: &str =
+        "---\nname: noted\ndescription: notes\nmetadata:\n  skill_author: J. Doe\n---\n# Noted\nbody\n";
+    // Valid frontmatter, but no author and no license → `non-compliant`. This is
+    // the fallout-uncredited-encounters shape: parseable, yet credits no one.
+    const VALID_BUT_UNCREDITED_SKILL: &str =
+        "---\nname: wasteland\ndescription: encounters\n---\n# Wasteland\nbody\n";
+    // No frontmatter at all → also `non-compliant` (and malformed per SEP-2640).
     const UNCREDITED_SKILL: &str = "# Mystery\nNo frontmatter, attributed to no one.\n";
 
     #[tokio::test]
     async fn attribution_gate_off_loads_uncredited() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, None::<&str>)]);
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, None::<&str>)]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
         assert!(
@@ -2911,7 +2933,7 @@ mod tests {
 
     #[tokio::test]
     async fn attribution_gate_on_blocks_uncredited() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
         let result = result.expect("uncredited skill must be withheld when the gate is on");
@@ -2922,8 +2944,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attribution_gate_on_blocks_valid_but_uncredited() {
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let result = super::enforce_skill_attribution(
+            "s1",
+            "skill://x/SKILL.md",
+            VALID_BUT_UNCREDITED_SKILL,
+        )
+        .await;
+        let result = result
+            .expect("a parseable skill that credits no one must be withheld when the gate is on");
+        assert!(result.is_error.unwrap_or(false));
+        assert!(text_of(&result).contains("non-compliant"));
+    }
+
+    #[tokio::test]
+    async fn attribution_gate_on_loads_partial() {
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
+        let result =
+            super::enforce_skill_attribution("s1", "skill://x/SKILL.md", PARTIAL_SKILL).await;
+        assert!(
+            result.is_none(),
+            "a partially-attributed skill (author present) must still load"
+        );
+    }
+
+    #[tokio::test]
     async fn attribution_gate_on_loads_compliant() {
-        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, Some("true"))]);
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_REQUIRE_KEY, Some("true"))]);
         let result =
             super::enforce_skill_attribution("s1", "skill://x/SKILL.md", COMPLIANT_SKILL).await;
         assert!(
