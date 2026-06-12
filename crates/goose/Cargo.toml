@@ -72,6 +72,7 @@ workspace = true
 
 [dependencies]
 lru = { workspace = true }
+mcp-ext-interceptors = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-child-process",

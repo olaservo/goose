@@ -21,6 +21,7 @@ string_slice = "warn"
 
 [workspace.dependencies]
 rmcp = { version = "1.4", default-features = false, features = ["schemars", "auth"] }
+mcp-ext-interceptors = { git = "https://github.com/olaservo/experimental-ext-interceptors", rev = "cecf0a9cc7791d95b9836a0b45597234d1e75e22" }
 agent-client-protocol-schema = { version = "0.12", default-features = false, features = ["unstable"] }
 agent-client-protocol = { version = "0.11", default-features = false }
 arboard = { version = "3", default-features = false }

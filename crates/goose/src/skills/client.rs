@@ -4,15 +4,22 @@ use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::mcp_client::{Error, McpClientTrait};
 use crate::agents::ToolCallContext;
+use crate::config::Config;
 use async_trait::async_trait;
 use goose_sdk::custom_requests::{SourceEntry, SourceType};
+use mcp_ext_interceptors::{
+    attribution::attribution_validator,
+    chain::Chain,
+    events::RESOURCES_READ,
+    invocation::{InvocationContext, Principal, SystemClock},
+};
 use rmcp::model::{
     CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
     ResourceContents, ServerCapabilities, ServerNotification, Tool,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -569,6 +576,10 @@ async fn read_mcp_and_frame(
         Ok(result) => match first_text_content(result, &entry.server, uri) {
             Some(body) => {
                 if is_skill_md {
+                    if let Some(withheld) = enforce_skill_attribution(session_id, uri, &body).await
+                    {
+                        return withheld;
+                    }
                     let mut output = format!(
                         "# Loaded Skill: {} (mcp skill from {})\n\n{}\n",
                         entry.name, entry.server, body
@@ -608,6 +619,71 @@ async fn read_mcp_and_frame(
             uri, entry.server, e.message
         ))]),
     }
+}
+
+/// Config key gating SKILL.md attribution enforcement. Off by default: when
+/// unset, MCP skills load exactly as before. When set true, a SKILL.md that
+/// fails the SEP-2640 attribution check is withheld from the model.
+const ATTRIBUTION_ENFORCE_KEY: &str = "GOOSE_SKILLS_ATTRIBUTION_ENFORCE";
+
+/// Runs a loaded SKILL.md body through the `mcp-ext-interceptors` attribution
+/// chain — the same in-process mount the standalone demo uses, here at Goose's
+/// real `load_skill` boundary. Returns `Some(error_result)` when enforcement is
+/// enabled and the skill is non-compliant (the body is then withheld instead of
+/// returned to the model), or `None` when the gate is off or the skill passes.
+async fn enforce_skill_attribution(
+    session_id: &str,
+    uri: &str,
+    body: &str,
+) -> Option<CallToolResult> {
+    if !Config::global()
+        .get_param::<bool>(ATTRIBUTION_ENFORCE_KEY)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let chain = Chain::new().with(attribution_validator(Arc::new(SystemClock)));
+    let ctx = InvocationContext {
+        principal: Some(Principal {
+            principal_type: "user".to_string(),
+            id: Some(session_id.to_string()),
+            claims: None,
+        }),
+        trace_id: Some(session_id.to_string()),
+        ..Default::default()
+    };
+    let payload = serde_json::json!({
+        "contents": [{ "uri": uri, "text": body }]
+    });
+
+    let outcome = chain
+        .execute_response(RESOURCES_READ, payload, Some(ctx))
+        .await;
+    if outcome.ok() {
+        return None;
+    }
+
+    let compliance = outcome
+        .results
+        .first()
+        .and_then(|r| r.info.as_ref())
+        .and_then(|i| i.get("complianceLevel"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("non-compliant");
+    let reasons = outcome
+        .aborts
+        .iter()
+        .map(|a| a.reason.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    warn!(
+        uri,
+        compliance, "withholding skill: failed attribution check"
+    );
+    Some(CallToolResult::error(vec![Content::text(format!(
+        "Skill '{uri}' was withheld: it failed the attribution check ({compliance}). {reasons}"
+    ))]))
 }
 
 #[async_trait]
@@ -2815,5 +2891,44 @@ mod tests {
         assert!(fs_text.contains("fs supporting body"));
         assert!(mcp_text.contains("mcp-demo/guide.md"));
         assert!(mcp_text.contains("mcp supporting body"));
+    }
+
+    // ---------- Skill attribution gate ----------
+
+    const COMPLIANT_SKILL: &str = "---\nname: demo\nlicense: CC-BY-4.0\nmetadata:\n  skill_author: Vault-Tec\n  sources:\n    - https://example.com\n  attribution: \"Derived from the example SRD.\"\n---\n# Demo\nbody\n";
+    const UNCREDITED_SKILL: &str = "# Mystery\nNo frontmatter, attributed to no one.\n";
+
+    #[tokio::test]
+    async fn attribution_gate_off_loads_uncredited() {
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, None::<&str>)]);
+        let result =
+            super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
+        assert!(
+            result.is_none(),
+            "gate off must not withhold any skill, even an uncredited one"
+        );
+    }
+
+    #[tokio::test]
+    async fn attribution_gate_on_blocks_uncredited() {
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, Some("true"))]);
+        let result =
+            super::enforce_skill_attribution("s1", "skill://x/SKILL.md", UNCREDITED_SKILL).await;
+        let result = result.expect("uncredited skill must be withheld when the gate is on");
+        assert!(result.is_error.unwrap_or(false));
+        let text = text_of(&result);
+        assert!(text.contains("withheld"), "got: {text}");
+        assert!(text.contains("non-compliant"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn attribution_gate_on_loads_compliant() {
+        let _guard = env_lock::lock_env([(super::ATTRIBUTION_ENFORCE_KEY, Some("true"))]);
+        let result =
+            super::enforce_skill_attribution("s1", "skill://x/SKILL.md", COMPLIANT_SKILL).await;
+        assert!(
+            result.is_none(),
+            "a compliant skill must load even with the gate on"
+        );
     }
 }

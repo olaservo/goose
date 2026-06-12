@@ -4498,6 +4498,7 @@ dependencies = [
  "llama-cpp-2",
  "llama-cpp-sys-2",
  "lru",
+ "mcp-ext-interceptors",
  "minijinja",
  "mockall",
  "nanoid",
@@ -6063,6 +6064,19 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "mcp-ext-interceptors"
+version = "0.1.0"
+source = "git+https://github.com/olaservo/experimental-ext-interceptors?rev=cecf0a9cc7791d95b9836a0b45597234d1e75e22#cecf0a9cc7791d95b9836a0b45597234d1e75e22"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+]
 
 [[package]]
 name = "md-5"
@@ -8952,6 +8966,19 @@ name = "serde_yaml"
 version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap 2.14.0",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap 2.14.0",
  "itoa",
