@@ -1793,7 +1793,6 @@ export type McpSkillServerSummary = {
     concreteCount: number;
     server: string;
     skillsEnabled: boolean;
-    templateCount: number;
 };
 
 export type SetSkillsEnabledRequest = {

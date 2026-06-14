@@ -9607,7 +9607,6 @@
         "required": [
           "server",
           "concreteCount",
-          "templateCount",
           "skillsEnabled"
         ],
         "properties": {
@@ -9620,10 +9619,6 @@
           },
           "skillsEnabled": {
             "type": "boolean"
-          },
-          "templateCount": {
-            "type": "integer",
-            "minimum": 0
           }
         }
       },

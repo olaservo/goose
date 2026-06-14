@@ -184,9 +184,6 @@ pub struct GooseMcpAppToolAttachment {
 pub struct McpSkillServerSummary {
     pub server: String,
     pub concrete_count: usize,
-    /// Always 0: skill templates were removed from the SEP. Retained for
-    /// API/schema stability; remove on the next breaking openapi revision.
-    pub template_count: usize,
     pub skills_enabled: bool,
 }
 
@@ -1531,7 +1528,6 @@ impl ExtensionManager {
             out.push(McpSkillServerSummary {
                 server,
                 concrete_count: cache.concrete.len(),
-                template_count: 0,
                 skills_enabled,
             });
         }

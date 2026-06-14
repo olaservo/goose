@@ -163,7 +163,7 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
         });
         setPendingServers(
           (servers.data ?? []).filter(
-            (s) => !s.skillsEnabled && s.concreteCount + s.templateCount > 0
+            (s) => !s.skillsEnabled && s.concreteCount > 0
           )
         );
       } else {
@@ -297,7 +297,7 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
                   <p className="text-sm truncate">
                     {intl.formatMessage(i18n.nudgeText, {
                       server: server.server,
-                      count: server.concreteCount + server.templateCount,
+                      count: server.concreteCount,
                     })}
                   </p>
                 </div>
