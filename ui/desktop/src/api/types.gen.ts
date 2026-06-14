@@ -1784,6 +1784,31 @@ export type WindowProps = {
     width: number;
 };
 
+/**
+ * Discovery-time summary of one server's MCP-served skills plus the user's
+ * current injection-consent state. Powers the opt-in nudge; carries counts,
+ * never skill bodies.
+ */
+export type McpSkillServerSummary = {
+    concreteCount: number;
+    server: string;
+    skillsEnabled: boolean;
+    templateCount: number;
+};
+
+export type SetSkillsEnabledRequest = {
+    /**
+     * Config key of the extension whose skills injection is being toggled.
+     */
+    name: string;
+    /**
+     * When set, the running agent's in-memory gate is flipped too so the
+     * change takes effect on the next turn without reconnecting.
+     */
+    session_id?: string | null;
+    skills_enabled: boolean;
+};
+
 export type ConfirmToolActionData = {
     body: ConfirmToolActionRequest;
     path?: never;
@@ -4882,6 +4907,48 @@ export type StopTunnelError = StopTunnelErrors[keyof StopTunnelErrors];
 export type StopTunnelResponses = {
     /**
      * Tunnel stopped successfully
+     */
+    200: unknown;
+};
+
+export type GetMcpSkillServersData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Session id whose connected extensions are inspected for discovered skills.
+         */
+        session_id: string;
+    };
+    url: '/config/mcp_skill_servers';
+};
+
+export type GetMcpSkillServersResponses = {
+    /**
+     * MCP skill servers retrieved successfully
+     */
+    200: Array<McpSkillServerSummary>;
+};
+
+export type GetMcpSkillServersResponse = GetMcpSkillServersResponses[keyof GetMcpSkillServersResponses];
+
+export type SetExtensionSkillsEnabledData = {
+    body: SetSkillsEnabledRequest;
+    path?: never;
+    query?: never;
+    url: '/config/extensions/skills_enabled';
+};
+
+export type SetExtensionSkillsEnabledErrors = {
+    /**
+     * Extension not found
+     */
+    404: unknown;
+};
+
+export type SetExtensionSkillsEnabledResponses = {
+    /**
+     * Skills injection preference updated
      */
     200: unknown;
 };

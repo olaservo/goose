@@ -27,6 +27,9 @@ pub fn looks_like_uri(s: &str) -> bool {
     let Some(colon_idx) = s.find("://") else {
         return false;
     };
+    // `colon_idx` is the byte offset of the ASCII `:` in `://`, always a
+    // valid UTF-8 boundary.
+    #[allow(clippy::string_slice)]
     let scheme = &s[..colon_idx];
     let mut chars = scheme.chars();
     let Some(first) = chars.next() else {

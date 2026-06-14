@@ -84,6 +84,7 @@ impl GooseAcpAgent {
 
         crate::config::extensions::set_extension(crate::config::extensions::ExtensionEntry {
             enabled: req.enabled,
+            skills_enabled: false,
             config,
         });
         Ok(EmptyResponse {})

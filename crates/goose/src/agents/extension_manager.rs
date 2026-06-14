@@ -68,6 +68,16 @@ fn resolve_timeout(timeout: Option<u64>) -> u64 {
     })
 }
 
+/// Handles cloned out of an existing registration to drive the
+/// `add_extension` fast-path (no-op re-register or in-place skill-cache
+/// refresh) without holding the extensions mutex across the await points.
+type ExtensionFastPathHandles = (
+    McpClientBox,
+    std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    CancellationToken,
+);
+
 struct Extension {
     pub config: ExtensionConfig,
     /// Resolved config snapshot (with secrets from keyring substituted)
@@ -79,13 +89,20 @@ struct Extension {
     client: McpClientBox,
     server_info: Option<ServerInfo>,
     _temp_dir: Option<tempfile::TempDir>,
-    /// Cache of MCP-served skills (both concrete and templated)
-    /// discovered from this extension's `skill://index.json` at connect
+    /// Cache of MCP-served skills discovered from this extension's
+    /// `skill://index.json` at connect
     /// time, and refreshed in place on
     /// `notifications/resources/list_changed`. The `Arc<RwLock<…>>` lets
     /// a background subscriber task (spawned in `add_extension` /
     /// `add_client`) update the cache without holding `&mut Extension`.
     mcp_skills: std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>,
+    /// Opt-in consent to inject this server's discovered skills into the
+    /// model's context. Initialized from the persisted `skills_enabled`
+    /// config flag at registration and flipped in place by
+    /// `set_skills_enabled` so a toggle takes effect without reconnecting.
+    /// Discovery (the `mcp_skills` cache) is unconditional; only injection
+    /// is gated on this.
+    skills_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set once when this Extension's `list_changed` watcher task is
     /// spawned. Used by `spawn_skill_list_changed_watcher` to stay
     /// idempotent across multiple registration paths — the repopulate
@@ -99,6 +116,7 @@ struct Extension {
 }
 
 impl Extension {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: ExtensionConfig,
         resolved_config: ExtensionConfig,
@@ -106,6 +124,7 @@ impl Extension {
         server_info: Option<ServerInfo>,
         temp_dir: Option<tempfile::TempDir>,
         mcp_skills: std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>,
+        skills_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
         watcher_spawned: std::sync::Arc<std::sync::atomic::AtomicBool>,
         cancel: CancellationToken,
     ) -> Self {
@@ -116,6 +135,7 @@ impl Extension {
             server_info,
             _temp_dir: temp_dir,
             mcp_skills,
+            skills_enabled,
             watcher_spawned,
             cancel,
         }
@@ -154,6 +174,20 @@ pub struct GooseMcpAppToolAttachment {
     pub resource_result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_error: Option<String>,
+}
+
+/// Discovery-time summary of one server's MCP-served skills plus the user's
+/// current injection-consent state. Powers the opt-in nudge; carries counts,
+/// never skill bodies.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct McpSkillServerSummary {
+    pub server: String,
+    pub concrete_count: usize,
+    /// Always 0: skill templates were removed from the SEP. Retained for
+    /// API/schema stability; remove on the next breaking openapi revision.
+    pub template_count: usize,
+    pub skills_enabled: bool,
 }
 
 pub(crate) const TRUSTED_TOOL_UPDATE_META_KEY: &str = "__goose_tool_update_meta";
@@ -960,12 +994,7 @@ impl ExtensionManager {
         // spawned at that point — this is the path that fixes that
         // case: we now have a session id, so we spawn (idempotent via
         // `watcher_spawned`).
-        let fast_path: Option<(
-            McpClientBox,
-            std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>,
-            std::sync::Arc<std::sync::atomic::AtomicBool>,
-            CancellationToken,
-        )> = {
+        let fast_path: Option<ExtensionFastPathHandles> = {
             let extensions = self.extensions.lock().await;
             match extensions.get(&sanitized_name) {
                 Some(existing)
@@ -1236,6 +1265,9 @@ impl ExtensionManager {
         let mcp_skills =
             populate_mcp_skills_cache(&sanitized_name, client_arc.as_ref(), session_id).await;
         let cache = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_skills));
+        let skills_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            crate::config::extensions::is_skills_enabled(&sanitized_name),
+        ));
         let watcher_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = CancellationToken::new();
 
@@ -1264,6 +1296,7 @@ impl ExtensionManager {
                 server_info,
                 temp_dir,
                 cache,
+                skills_enabled,
                 watcher_spawned,
                 cancel,
             ),
@@ -1287,6 +1320,9 @@ impl ExtensionManager {
 
         let mcp_skills = populate_mcp_skills_cache(&normalized, client.as_ref(), session_id).await;
         let cache = std::sync::Arc::new(tokio::sync::RwLock::new(mcp_skills));
+        let skills_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            crate::config::extensions::is_skills_enabled(&normalized),
+        ));
         let watcher_spawned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = CancellationToken::new();
 
@@ -1308,6 +1344,7 @@ impl ExtensionManager {
                 info,
                 temp_dir,
                 cache,
+                skills_enabled,
                 watcher_spawned,
                 cancel,
             ),
@@ -1399,21 +1436,16 @@ impl ExtensionManager {
     }
 
     /// Snapshot every connected extension's cached **concrete** MCP skill
-    /// entries. Read path for the skills platform extension's per-turn
-    /// system-prompt assembly — no network I/O. Templates are surfaced
-    /// separately via [`aggregated_mcp_skill_templates`].
+    /// entries — the **unfiltered** discovery view (all servers, opted-in or
+    /// not). Backs the human-facing slash-command list, `load_skill`
+    /// resolution, and the per-server summary. Injection into the model's
+    /// prompt uses the gated [`injectable_mcp_skills`] instead.
     pub async fn aggregated_mcp_skills(&self) -> Vec<crate::skills::mcp_client::McpSkillEntry> {
         // Clone the cache Arcs out of the extensions map first, then
         // release the extensions mutex before taking the per-extension
         // RwLock reads — avoids holding the extensions mutex across an
         // async wait.
-        let caches: Vec<_> = self
-            .extensions
-            .lock()
-            .await
-            .values()
-            .map(|ext| ext.mcp_skills.clone())
-            .collect();
+        let caches = self.skill_caches(false).await;
 
         let mut out = Vec::new();
         for cache in &caches {
@@ -1422,23 +1454,86 @@ impl ExtensionManager {
         out
     }
 
-    /// Snapshot every connected extension's cached MCP skill **template**
-    /// entries. Drives the templated-catalog section of the system prompt
-    /// and the `load_skill_template` resolution path.
-    pub async fn aggregated_mcp_skill_templates(
-        &self,
-    ) -> Vec<crate::skills::mcp_client::McpSkillTemplate> {
-        let caches: Vec<_> = self
-            .extensions
-            .lock()
-            .await
-            .values()
-            .map(|ext| ext.mcp_skills.clone())
-            .collect();
+    /// Concrete MCP skills of only the servers the user has opted into
+    /// injecting. This is the gated read path for per-turn system-prompt
+    /// assembly; opted-out servers' caches stay populated for discovery.
+    pub async fn injectable_mcp_skills(&self) -> Vec<crate::skills::mcp_client::McpSkillEntry> {
+        let caches = self.skill_caches(true).await;
 
         let mut out = Vec::new();
         for cache in &caches {
-            out.extend(cache.read().await.templates.iter().cloned());
+            out.extend(cache.read().await.concrete.iter().cloned());
+        }
+        out
+    }
+
+    /// Clone out each extension's skill-cache Arc, releasing the extensions
+    /// mutex before any per-cache `RwLock` read. When `injectable_only`, skips
+    /// servers the user has not opted into injecting — the single choke point
+    /// that gates injection without touching discovery.
+    async fn skill_caches(
+        &self,
+        injectable_only: bool,
+    ) -> Vec<std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>> {
+        self.extensions
+            .lock()
+            .await
+            .values()
+            .filter(|ext| {
+                !injectable_only
+                    || ext
+                        .skills_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .map(|ext| ext.mcp_skills.clone())
+            .collect()
+    }
+
+    /// Flip a server's skills-injection consent at runtime. Mirrors the
+    /// persisted `skills_enabled` config flag so a toggle takes effect on the
+    /// next turn without reconnecting the extension. No-op if `name` is not a
+    /// connected extension.
+    pub async fn set_skills_enabled(&self, name: &str, enabled: bool) {
+        let normalized = name_to_key(name);
+        if let Some(ext) = self.extensions.lock().await.get(&normalized) {
+            ext.skills_enabled
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Per-server summary of discovered skills with the current injection
+    /// consent state — the **unfiltered** view that powers the
+    /// discovery-driven nudge ("server X offers N skills — enable?"). Unlike
+    /// [`aggregated_mcp_skills`], this includes servers the user has not opted
+    /// into, and reports only counts rather than the skill bodies.
+    pub async fn mcp_skill_servers(&self) -> Vec<McpSkillServerSummary> {
+        let entries: Vec<_> = self
+            .extensions
+            .lock()
+            .await
+            .iter()
+            .map(|(key, ext)| {
+                (
+                    key.clone(),
+                    ext.mcp_skills.clone(),
+                    ext.skills_enabled
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                )
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for (server, cache, skills_enabled) in entries {
+            let cache = cache.read().await;
+            if cache.is_empty() {
+                continue;
+            }
+            out.push(McpSkillServerSummary {
+                server,
+                concrete_count: cache.concrete.len(),
+                template_count: 0,
+                skills_enabled,
+            });
         }
         out
     }
@@ -1738,22 +1833,30 @@ impl ExtensionManager {
             })
     }
 
-    /// Forward a `completion/complete` request for a resource-template
-    /// argument to a specific extension. Used by the skills platform
-    /// extension to validate placeholder values before instantiating an
-    /// `mcp-resource-template` skill catalog. Returns `TransportClosed`
-    /// (and similar) when the server doesn't implement completion —
-    /// callers MUST treat that as "completion unsupported" rather than a
-    /// hard failure (per the SEP, completion is SHOULD, not MUST).
-    pub async fn complete_resource_for_server(
+    /// Whether the given server declared the skills extension with
+    /// `directoryRead: true`. Gate for [`directory_read_for_server`] — per the
+    /// SEP, clients MUST NOT call `resources/directory/read` otherwise.
+    pub async fn server_supports_directory_read(&self, extension_name: &str) -> bool {
+        let Some(client) = self.get_server_client(extension_name).await else {
+            return false;
+        };
+        client
+            .get_info()
+            .is_some_and(crate::skills::mcp_client::server_declares_directory_read)
+    }
+
+    /// List the direct children of a directory-like resource via the skills
+    /// extension's `resources/directory/read` method, following pagination.
+    /// Returns metadata-only `Resource`s (files and `inode/directory`
+    /// children); the skills extension walks the tree by recursing into
+    /// directories. Only call when [`server_supports_directory_read`] is true.
+    pub async fn directory_read_for_server(
         &self,
         session_id: &str,
+        uri: &str,
         extension_name: &str,
-        uri_template: &str,
-        argument_name: &str,
-        current_value: &str,
         cancellation_token: CancellationToken,
-    ) -> Result<rmcp::model::CompletionInfo, ErrorData> {
+    ) -> Result<Vec<rmcp::model::Resource>, ErrorData> {
         let client = self
             .get_server_client(extension_name)
             .await
@@ -1765,22 +1868,29 @@ impl ExtensionManager {
                 )
             })?;
 
-        client
-            .complete_resource_argument(
-                session_id,
-                uri_template,
-                argument_name,
-                current_value,
-                cancellation_token,
-            )
-            .await
-            .map_err(|e| {
-                ErrorData::new(
-                    ErrorCode::INTERNAL_ERROR,
-                    format!("completion/complete failed for {}: {:?}", extension_name, e),
-                    None,
-                )
-            })
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = client
+                .directory_read(session_id, uri, cursor.clone(), cancellation_token.clone())
+                .await
+                .map_err(|e| {
+                    ErrorData::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!(
+                            "resources/directory/read failed for {} ({}): {:?}",
+                            extension_name, uri, e
+                        ),
+                        None,
+                    )
+                })?;
+            out.extend(page.resources);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     pub async fn read_resource(
@@ -2418,6 +2528,7 @@ mod tests {
                 std::sync::Arc::new(tokio::sync::RwLock::new(
                     crate::skills::mcp_client::ServerSkills::default(),
                 )),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 CancellationToken::new(),
             );

@@ -840,6 +840,7 @@ pub async fn add_extension(
 
     goose::config::set_extension(ExtensionEntry {
         enabled: extension_query.enabled,
+        skills_enabled: false,
         config: extension_query.config,
     });
 
@@ -1100,6 +1101,89 @@ pub async fn get_slash_commands(
     }
 
     Ok(Json(SlashCommandsResponse { commands }))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+pub struct McpSkillServersQuery {
+    /// Session id whose connected extensions are inspected for discovered skills.
+    pub session_id: String,
+}
+
+/// Per-server summary of MCP-discovered skills and the user's injection-consent
+/// state. Unlike `/config/slash_commands`, this is unfiltered — it includes
+/// servers the user has not yet opted into, so the UI can nudge them.
+#[utoipa::path(
+    get,
+    path = "/config/mcp_skill_servers",
+    params(McpSkillServersQuery),
+    responses(
+        (status = 200, description = "MCP skill servers retrieved successfully", body = [goose::agents::extension_manager::McpSkillServerSummary])
+    )
+)]
+pub async fn get_mcp_skill_servers(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<McpSkillServersQuery>,
+) -> Result<Json<Vec<goose::agents::extension_manager::McpSkillServerSummary>>, ErrorResponse> {
+    let servers = match state.get_agent(query.session_id).await {
+        Ok(agent) => agent.extension_manager.mcp_skill_servers().await,
+        Err(_) => Vec::new(),
+    };
+    Ok(Json(servers))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SetSkillsEnabledRequest {
+    /// Config key of the extension whose skills injection is being toggled.
+    pub name: String,
+    pub skills_enabled: bool,
+    /// When set, the running agent's in-memory gate is flipped too so the
+    /// change takes effect on the next turn without reconnecting.
+    pub session_id: Option<String>,
+}
+
+/// Opt a server's skills into (or out of) injection. Persists the choice and,
+/// when a `session_id` is given, updates the live agent in place.
+#[utoipa::path(
+    post,
+    path = "/config/extensions/skills_enabled",
+    request_body = SetSkillsEnabledRequest,
+    responses(
+        (status = 200, description = "Skills injection preference updated"),
+        (status = 404, description = "Extension not found")
+    )
+)]
+pub async fn set_extension_skills_enabled(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    Json(req): Json<SetSkillsEnabledRequest>,
+) -> Result<Json<String>, ErrorResponse> {
+    let keys = goose::config::get_all_extension_names();
+    if !keys.iter().any(|k| k == &req.name) {
+        return Err(ErrorResponse::not_found(format!(
+            "Extension '{}' not found",
+            req.name
+        )));
+    }
+
+    goose::config::set_extension_skills_enabled(&req.name, req.skills_enabled);
+
+    if let Some(session_id) = req.session_id {
+        if let Ok(agent) = state.get_agent(session_id).await {
+            agent
+                .extension_manager
+                .set_skills_enabled(&req.name, req.skills_enabled)
+                .await;
+        }
+    }
+
+    Ok(Json(format!(
+        "Skills injection {} for {}",
+        if req.skills_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        req.name
+    )))
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1523,6 +1607,11 @@ pub fn routes(state: Arc<AppState>) -> Router {
             post(cleanup_provider_cache),
         )
         .route("/config/slash_commands", get(get_slash_commands))
+        .route("/config/mcp_skill_servers", get(get_mcp_skill_servers))
+        .route(
+            "/config/extensions/skills_enabled",
+            post(set_extension_skills_enabled),
+        )
         .route(
             "/config/canonical-model-info",
             post(get_canonical_model_info),

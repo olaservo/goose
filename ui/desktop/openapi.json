@@ -4115,6 +4115,66 @@
           }
         }
       }
+    },
+    "/config/mcp_skill_servers": {
+      "get": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "get_mcp_skill_servers",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "query",
+            "description": "Session id whose connected extensions are inspected for discovered skills.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MCP skill servers retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpSkillServerSummary"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/config/extensions/skills_enabled": {
+      "post": {
+        "tags": [
+          "super::routes::config_management"
+        ],
+        "operationId": "set_extension_skills_enabled",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetSkillsEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Skills injection preference updated"
+          },
+          "404": {
+            "description": "Extension not found"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -9538,6 +9598,53 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "McpSkillServerSummary": {
+        "type": "object",
+        "description": "Discovery-time summary of one server's MCP-served skills plus the user's\ncurrent injection-consent state. Powers the opt-in nudge; carries counts,\nnever skill bodies.",
+        "required": [
+          "server",
+          "concreteCount",
+          "templateCount",
+          "skillsEnabled"
+        ],
+        "properties": {
+          "concreteCount": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "server": {
+            "type": "string"
+          },
+          "skillsEnabled": {
+            "type": "boolean"
+          },
+          "templateCount": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "SetSkillsEnabledRequest": {
+        "type": "object",
+        "required": [
+          "name",
+          "skills_enabled"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Config key of the extension whose skills injection is being toggled."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "When set, the running agent's in-memory gate is flipped too so the\nchange takes effect on the next turn without reconnecting.",
+            "nullable": true
+          },
+          "skills_enabled": {
+            "type": "boolean"
           }
         }
       }

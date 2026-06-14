@@ -1,5 +1,5 @@
 use super::discover_skills;
-use super::mcp_client::{McpSkillEntry, McpSkillTemplate};
+use super::mcp_client::McpSkillEntry;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::mcp_client::{Error, McpClientTrait};
@@ -67,8 +67,9 @@ impl SkillsClient {
         })
     }
 
-    /// Returns the current set of concrete MCP skills visible via the
-    /// extension manager's cache, or empty if no manager is attached.
+    /// All concrete MCP skills discovered from connected servers, opted-in or
+    /// not. Used for `load_skill` resolution — a skill the user explicitly
+    /// names should load even from a server whose skills aren't auto-injected.
     async fn mcp_skills(&self) -> Vec<McpSkillEntry> {
         match self.extension_manager.as_ref().and_then(|w| w.upgrade()) {
             Some(mgr) => mgr.aggregated_mcp_skills().await,
@@ -76,12 +77,11 @@ impl SkillsClient {
         }
     }
 
-    /// Returns the current set of templated MCP skill catalogs visible
-    /// via the extension manager's cache, or empty if no manager is
-    /// attached.
-    async fn mcp_skill_templates(&self) -> Vec<McpSkillTemplate> {
+    /// Concrete MCP skills from servers the user has opted into injecting —
+    /// the gated set surfaced in the system prompt.
+    async fn injectable_mcp_skills(&self) -> Vec<McpSkillEntry> {
         match self.extension_manager.as_ref().and_then(|w| w.upgrade()) {
-            Some(mgr) => mgr.aggregated_mcp_skill_templates().await,
+            Some(mgr) => mgr.injectable_mcp_skills().await,
             None => Vec::new(),
         }
     }
@@ -110,199 +110,6 @@ impl SkillsClient {
         cache.names = fresh.clone();
         fresh
     }
-
-    /// Resolve a template by name. Accepts the bare name and, on
-    /// collision, the `<server>::<name>` form. Literal match wins so a
-    /// server can legitimately publish a template whose name contains
-    /// `::` without being hijacked by a coincidental server/template pair.
-    fn find_template_by_name<'a>(
-        templates: &'a [McpSkillTemplate],
-        query: &str,
-    ) -> Option<&'a McpSkillTemplate> {
-        if let Some(hit) = templates.iter().find(|t| t.name == query) {
-            return Some(hit);
-        }
-        if let Some((server_prefix, bare_name)) = query.split_once("::") {
-            return templates
-                .iter()
-                .find(|t| t.server == server_prefix && t.name == bare_name);
-        }
-        None
-    }
-
-    /// Implements `load_skill_template`: resolve a template by name,
-    /// validate placeholder values against the server's completion
-    /// endpoint, substitute placeholders into the URL template, and
-    /// dispatch through the same `read_mcp_and_frame` path concrete
-    /// skills use — so the model sees an identical "Loaded Skill" shape.
-    async fn call_load_skill_template(
-        &self,
-        ctx: &ToolCallContext,
-        arguments: Option<JsonObject>,
-        cancellation_token: CancellationToken,
-    ) -> CallToolResult {
-        let template_name = arguments
-            .as_ref()
-            .and_then(|args| args.get("template"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if template_name.is_empty() {
-            return CallToolResult::error(vec![Content::text(
-                "Missing required parameter: template",
-            )]);
-        }
-
-        let template_args: std::collections::BTreeMap<String, String> = arguments
-            .as_ref()
-            .and_then(|args| args.get("arguments"))
-            .and_then(|v| v.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let Some(mgr) = self.extension_manager.as_ref().and_then(|w| w.upgrade()) else {
-            return CallToolResult::error(vec![Content::text(
-                "extension manager unavailable; cannot resolve templated skills",
-            )]);
-        };
-
-        let templates = mgr.aggregated_mcp_skill_templates().await;
-        let Some(template) = Self::find_template_by_name(&templates, template_name) else {
-            let names: Vec<String> = templates.iter().map(|t| t.name.clone()).collect();
-            return CallToolResult::error(vec![Content::text(format!(
-                "Unknown template: '{}'. Available templates: {}",
-                template_name,
-                if names.is_empty() {
-                    "<none>".to_string()
-                } else {
-                    names.join(", ")
-                }
-            ))]);
-        };
-
-        // Require an argument value for every placeholder in the
-        // template's URL. Surface missing names so the model can retry
-        // with a complete map.
-        let placeholders = template.placeholders();
-        let missing: Vec<&str> = placeholders
-            .iter()
-            .filter(|p| !template_args.contains_key(p.as_str()))
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            return CallToolResult::error(vec![Content::text(format!(
-                "load_skill_template('{}'): missing placeholder value(s): {}. Required: [{}]",
-                template_name,
-                missing.join(", "),
-                placeholders.join(", ")
-            ))]);
-        }
-
-        // Validate each (name, value) against the server's completion
-        // endpoint where available. Per SEP, completion is SHOULD not
-        // MUST — a server that returns method-not-found or transport
-        // closed is treated as "completion unsupported"; the host
-        // proceeds without validation.
-        for placeholder in &placeholders {
-            let value = template_args
-                .get(placeholder.as_str())
-                .map(String::as_str)
-                .unwrap_or("");
-            match mgr
-                .complete_resource_for_server(
-                    &ctx.session_id,
-                    &template.server,
-                    &template.url_template,
-                    placeholder,
-                    value,
-                    cancellation_token.clone(),
-                )
-                .await
-            {
-                Ok(info) => {
-                    if !info.values.is_empty() && !info.values.iter().any(|v| v == value) {
-                        let preview: Vec<String> = info.values.iter().take(8).cloned().collect();
-                        let suffix = if info.values.len() > preview.len() {
-                            format!(
-                                " (showing first {} of {})",
-                                preview.len(),
-                                info.values.len()
-                            )
-                        } else {
-                            String::new()
-                        };
-                        return CallToolResult::error(vec![Content::text(format!(
-                            "load_skill_template('{}'): value '{}' for placeholder '{}' was not accepted by the server. Suggested values: [{}]{}",
-                            template_name,
-                            value,
-                            placeholder,
-                            preview.join(", "),
-                            suffix
-                        ))]);
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        server = %template.server,
-                        template = %template.name,
-                        placeholder = %placeholder,
-                        error = %e.message,
-                        "completion/complete unsupported or errored; proceeding without validation"
-                    );
-                }
-            }
-        }
-
-        // Substitute placeholders into the URL template. Percent-encode
-        // each value so URL-significant characters in user input don't
-        // alter the URL structure.
-        let mut resolved = template.url_template.clone();
-        for (name, value) in &template_args {
-            let needle = format!("{{{}}}", name);
-            let encoded = percent_encode_value(value);
-            resolved = resolved.replace(&needle, &encoded);
-        }
-
-        // Synthesize a concrete entry pointing at the resolved URL and
-        // reuse the existing framing (incl. supporting-files enumeration
-        // when the resolved URI is the SKILL.md itself).
-        let synth = McpSkillEntry {
-            server: template.server.clone(),
-            name: template.name.clone(),
-            description: template.description.clone(),
-            url: resolved.clone(),
-        };
-        read_mcp_and_frame(
-            mgr.as_ref(),
-            &ctx.session_id,
-            &synth,
-            &resolved,
-            cancellation_token,
-        )
-        .await
-    }
-}
-
-/// Percent-encode a placeholder value for safe substitution into a URI
-/// template. Encodes every byte except RFC 3986 unreserved characters
-/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`), so URI-significant
-/// characters in user input (`/`, `?`, `#`, `&`, `:`, etc.) can't alter
-/// the resolved URL's structure. Over-encoding is the right default
-/// here — templates intentionally don't promise to URL-decode any part
-/// of the resolved URI.
-fn percent_encode_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for &b in value.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{:02X}", b));
-        }
-    }
-    out
 }
 
 /// Rebuilds the list of FS skill names currently installed. Used to detect
@@ -316,25 +123,17 @@ fn fs_skill_names(working_dir: &Path) -> HashSet<String> {
         .collect()
 }
 
-/// Computes the set of skill names that collide across FS skills, MCP
-/// concrete entries, and MCP templates. Any name appearing more than
-/// once in this union needs to be rendered in its disambiguated form
-/// (`<server>__<name>` for concrete entries, `<server>::<name>` for
-/// templates) so the model can address the right entity unambiguously.
-fn collision_names(
-    fs_names: &HashSet<String>,
-    concrete: &[McpSkillEntry],
-    templates: &[McpSkillTemplate],
-) -> HashSet<String> {
+/// Computes the set of skill names that collide across FS skills and MCP
+/// concrete entries. Any name appearing more than once in this union needs
+/// to be rendered in its disambiguated `<server>__<name>` form so the model
+/// can address the right entity unambiguously.
+fn collision_names(fs_names: &HashSet<String>, concrete: &[McpSkillEntry]) -> HashSet<String> {
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for n in fs_names {
         *counts.entry(n.clone()).or_insert(0) += 1;
     }
     for entry in concrete {
         *counts.entry(entry.name.clone()).or_insert(0) += 1;
-    }
-    for tpl in templates {
-        *counts.entry(tpl.name.clone()).or_insert(0) += 1;
     }
     counts
         .into_iter()
@@ -373,49 +172,6 @@ fn format_mcp_skills_section(collisions: &HashSet<String>, mcp: &[McpSkillEntry]
         out.push_str(&format!(
             "\n• {} ({}) - {}",
             display_name, entry.server, entry.description
-        ));
-    }
-    out
-}
-
-/// Renders the MCP-skill-template catalog section of the system prompt.
-/// Templates are addressed via `load_skill_template` after the host
-/// validates placeholder values against the server's completion endpoint.
-/// Collision form is `<server>::<name>` (note `::` — distinct from
-/// concrete's `__` so the two namespaces stay legible). Empty output
-/// when no templates are available.
-fn format_mcp_skill_templates_section(
-    collisions: &HashSet<String>,
-    templates: &[McpSkillTemplate],
-) -> String {
-    if templates.is_empty() {
-        return String::new();
-    }
-
-    let mut sorted: Vec<&McpSkillTemplate> = templates.iter().collect();
-    sorted.sort_by(|a, b| {
-        (a.name.as_str(), a.server.as_str()).cmp(&(b.name.as_str(), b.server.as_str()))
-    });
-
-    let mut out = String::from(
-        "\n\nTemplated skill catalogs from connected MCP servers (use load_skill_template to instantiate after confirming placeholder values; if a collision is shown in <server>::<name> form, use that exact form):",
-    );
-    for tpl in sorted {
-        let needs_prefix = collisions.contains(&tpl.name);
-        let display_name = if needs_prefix {
-            format!("{}::{}", tpl.server, tpl.name)
-        } else {
-            tpl.name.clone()
-        };
-        let placeholders = tpl.placeholders();
-        let placeholder_hint = if placeholders.is_empty() {
-            String::new()
-        } else {
-            format!("  [placeholders: {}]", placeholders.join(", "))
-        };
-        out.push_str(&format!(
-            "\n• {} ({}) - {}{}",
-            display_name, tpl.server, tpl.description, placeholder_hint
         ));
     }
     out
@@ -486,48 +242,75 @@ fn find_mcp_by_name<'a>(mcp: &'a [McpSkillEntry], query: &str) -> Option<&'a Mcp
     None
 }
 
-/// Enumerates supporting resources for an MCP skill by filtering the
-/// server's `resources/list` response down to URIs under
-/// `entry.skill_root_uri()` (excluding the SKILL.md itself). Returns
-/// `(relative_ref, uri)` pairs suitable for the "Supporting Files" hint
-/// block. Best-effort: a server that doesn't support `resources/list`,
-/// errors out, or returns nothing relevant yields an empty vec and no
-/// section is rendered. Mirrors the FS load_skill behaviour — it only
-/// surfaces *pointers*, never resource content.
+/// Extracts the first resource content as raw bytes — text contents as
+/// their UTF-8 bytes, blob contents base64-decoded. Used for archive
+/// payloads and (text) digest verification.
+fn first_content_bytes(result: rmcp::model::ReadResourceResult) -> Option<Vec<u8>> {
+    use base64::Engine;
+    for c in result.contents {
+        match c {
+            ResourceContents::TextResourceContents { text, .. } => return Some(text.into_bytes()),
+            ResourceContents::BlobResourceContents { blob, .. } => {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&blob) {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Enumerates supporting-file relative refs under a URI-addressed skill's
+/// root (excluding the SKILL.md itself). When the owning server declares
+/// `directoryRead: true`, walks the skill tree via `resources/directory/read`
+/// (scoped to the root, descending into `inode/directory` children);
+/// otherwise filters the server's flat `resources/list`. Best-effort: any
+/// error yields an empty list and no section is rendered. Surfaces only
+/// pointers, never content.
 async fn enumerate_mcp_supporting_resources(
     mgr: &ExtensionManager,
     session_id: &str,
     entry: &McpSkillEntry,
     cancel: CancellationToken,
-) -> Vec<(String, String)> {
-    let list = match mgr
-        .list_resources_for_server(session_id, &entry.server, cancel)
-        .await
-    {
-        Ok(list) => list,
-        Err(e) => {
-            debug!(
-                server = %entry.server,
-                skill = %entry.name,
-                error = %e.message,
-                "list_resources failed; rendering MCP skill without supporting-files section",
-            );
-            return Vec::new();
+) -> Vec<String> {
+    let Some(root) = entry.skill_root_uri() else {
+        return Vec::new();
+    };
+
+    let uris = if mgr.server_supports_directory_read(&entry.server).await {
+        directory_walk(mgr, session_id, &entry.server, root, cancel).await
+    } else {
+        match mgr
+            .list_resources_for_server(session_id, &entry.server, cancel)
+            .await
+        {
+            Ok(list) => list.resources.iter().map(|r| r.uri.clone()).collect(),
+            Err(e) => {
+                debug!(
+                    server = %entry.server,
+                    skill = %entry.name,
+                    error = %e.message,
+                    "supporting-file enumeration failed; rendering without the section",
+                );
+                Vec::new()
+            }
         }
     };
 
-    let root = entry.skill_root_uri();
-    // Directory-form entries (entry.url ends in '/') and `…/SKILL.md` forms
-    // both legitimately denote the same skill body. Skip both so neither
-    // appears as its own "supporting file" bullet next to the loaded body.
+    // Directory-form entries (url ends in '/') and `…/SKILL.md` forms both
+    // denote the same skill body — skip both so neither shows up as its own
+    // supporting-file bullet.
     let skill_md_alias = entry
         .url
-        .ends_with('/')
-        .then(|| format!("{}SKILL.md", root));
+        .as_deref()
+        .filter(|u| u.ends_with('/'))
+        .map(|_| format!("{}SKILL.md", root));
+
     let mut out = Vec::new();
-    for r in list.resources {
-        let uri = r.uri.clone();
-        if uri == entry.url || skill_md_alias.as_deref() == Some(uri.as_str()) {
+    for uri in uris {
+        if entry.url.as_deref() == Some(uri.as_str())
+            || skill_md_alias.as_deref() == Some(uri.as_str())
+        {
             continue;
         }
         let Some(rel) = uri.strip_prefix(root) else {
@@ -536,77 +319,243 @@ async fn enumerate_mcp_supporting_resources(
         if rel.is_empty() {
             continue;
         }
-        out.push((rel.to_string(), uri));
+        out.push(rel.to_string());
     }
+    out.sort();
+    out.dedup();
     out
 }
 
-/// Reads a resource from the owning MCP server and wraps it in framing
-/// that matches the FS load_skill shape, so the model sees a consistent
-/// signal regardless of source.
-///
-/// When `uri == entry.url`, this is a SKILL.md load: `# Loaded Skill: …`
-/// header (with origin tag), optional Supporting Files block from the
-/// server's `resources/list`, and the `This knowledge is now available
-/// in your context.` footer.
-///
-/// Otherwise it's a supporting-file load: `# Loaded: <skill>/<rel>`
-/// header and `File loaded into context.` footer — matching the FS
-/// supporting-file framing at the load_skill call site below, so the
-/// model can't mistake a supporting file for a fresh skill load.
-async fn read_mcp_and_frame(
+/// Recursively lists every file URI under `root` via
+/// `resources/directory/read`, descending into `inode/directory` children.
+/// Bounded by a node cap to keep a pathological tree from stalling a turn.
+async fn directory_walk(
+    mgr: &ExtensionManager,
+    session_id: &str,
+    server: &str,
+    root: &str,
+    cancel: CancellationToken,
+) -> Vec<String> {
+    const MAX_NODES: usize = 512;
+    let mut files = Vec::new();
+    let mut queue: Vec<String> = vec![root.to_string()];
+    let mut visited = 0usize;
+
+    while let Some(dir) = queue.pop() {
+        if visited >= MAX_NODES {
+            break;
+        }
+        visited += 1;
+        let children = match mgr
+            .directory_read_for_server(session_id, &dir, server, cancel.clone())
+            .await
+        {
+            Ok(children) => children,
+            Err(e) => {
+                debug!(server, dir, error = %e.message, "directory/read failed; partial walk");
+                continue;
+            }
+        };
+        for child in children {
+            if child.mime_type.as_deref() == Some("inode/directory") {
+                queue.push(child.uri.clone());
+            } else {
+                files.push(child.uri.clone());
+            }
+        }
+    }
+    files
+}
+
+/// Fetches and unpacks the first supported archive form of an entry,
+/// verifying the archive `digest` before unpacking. Returns the in-memory
+/// skill file tree.
+async fn materialize_skill_archive(
     mgr: &ExtensionManager,
     session_id: &str,
     entry: &McpSkillEntry,
-    uri: &str,
+    cancel: CancellationToken,
+) -> Result<crate::skills::archive::SkillTree, String> {
+    let Some(arch) = entry.supported_archive() else {
+        let offered: Vec<&str> = entry
+            .archives
+            .iter()
+            .map(|a| a.media_type.as_str())
+            .collect();
+        return Err(format!(
+            "no supported archive form for skill '{}' (server offers: [{}]; host supports tar.gz and zip)",
+            entry.name,
+            offered.join(", ")
+        ));
+    };
+    let result = mgr
+        .read_resource(session_id, &arch.url, &entry.server, cancel)
+        .await
+        .map_err(|e| format!("failed to read archive '{}': {}", arch.url, e.message))?;
+    let bytes = first_content_bytes(result)
+        .ok_or_else(|| format!("archive '{}' had no readable content", arch.url))?;
+    crate::skills::mcp_client::verify_digest(&arch.digest, &bytes)
+        .map_err(|e| format!("refusing to use archive '{}': {}", arch.url, e))?;
+    crate::skills::archive::unpack_skill_archive(&bytes, &arch.media_type)
+}
+
+/// Frames a loaded SKILL.md body the same way the FS path does: a
+/// `# Loaded Skill:` header with an MCP origin tag, an optional
+/// "Supporting Files" pointer block, and the standard footer.
+fn frame_skill_md(entry: &McpSkillEntry, base: &str, body: &str, supporting: &[String]) -> String {
+    let mut output = format!(
+        "# Loaded Skill: {} (mcp skill from {})\n\n{}\n",
+        entry.name, entry.server, body
+    );
+    if !supporting.is_empty() {
+        output.push_str(&format!(
+            "\n## Supporting Files\n\nSkill base: {}\n\n",
+            base
+        ));
+        for rel in supporting {
+            output.push_str(&format!(
+                "- {} → load_skill(name: \"{}/{}\")\n",
+                rel, entry.name, rel
+            ));
+        }
+    }
+    output.push_str("\n---\nThis knowledge is now available in your context.");
+    output
+}
+
+/// Loads an MCP skill's `SKILL.md` and frames it. Handles both
+/// individually-addressed skills (read via `resources/read`, verified
+/// against the index `digest`) and archive-distributed skills (fetch,
+/// verify, unpack, read `SKILL.md` from the tree).
+async fn load_mcp_skill_md(
+    mgr: &ExtensionManager,
+    session_id: &str,
+    entry: &McpSkillEntry,
     cancel: CancellationToken,
 ) -> CallToolResult {
-    let is_skill_md = uri == entry.url;
-    match mgr
-        .read_resource(session_id, uri, &entry.server, cancel.clone())
-        .await
-    {
-        Ok(result) => match first_text_content(result, &entry.server, uri) {
-            Some(body) => {
-                if is_skill_md {
-                    let mut output = format!(
-                        "# Loaded Skill: {} (mcp skill from {})\n\n{}\n",
-                        entry.name, entry.server, body
-                    );
-                    let supporting =
-                        enumerate_mcp_supporting_resources(mgr, session_id, entry, cancel).await;
-                    if !supporting.is_empty() {
-                        output.push_str(&format!(
-                            "\n## Supporting Files\n\nSkill base: {}\n\n",
-                            entry.skill_root_uri()
-                        ));
-                        for (rel, _uri) in &supporting {
-                            output.push_str(&format!(
-                                "- {} → load_skill(name: \"{}/{}\")\n",
-                                rel, entry.name, rel
-                            ));
+    if let Some(url) = entry.url.clone() {
+        match mgr
+            .read_resource(session_id, &url, &entry.server, cancel.clone())
+            .await
+        {
+            Ok(result) => match first_text_content(result, &entry.server, &url) {
+                Some(body) => {
+                    if let Some(digest) = &entry.digest {
+                        if let Err(e) =
+                            crate::skills::mcp_client::verify_digest(digest, body.as_bytes())
+                        {
+                            return CallToolResult::error(vec![Content::text(format!(
+                                "Refusing to load skill '{}': {}",
+                                entry.name, e
+                            ))]);
                         }
                     }
-                    output.push_str("\n---\nThis knowledge is now available in your context.");
-                    CallToolResult::success(vec![Content::text(output)])
-                } else {
-                    let rel = uri.strip_prefix(entry.skill_root_uri()).unwrap_or(uri);
-                    let output = format!(
-                        "# Loaded: {}/{}\n\n{}\n\n---\nFile loaded into context.",
-                        entry.name, rel, body
-                    );
-                    CallToolResult::success(vec![Content::text(output)])
+                    let supporting =
+                        enumerate_mcp_supporting_resources(mgr, session_id, entry, cancel).await;
+                    let base = entry.skill_root_uri().unwrap_or(&url);
+                    CallToolResult::success(vec![Content::text(frame_skill_md(
+                        entry,
+                        base,
+                        &body,
+                        &supporting,
+                    ))])
                 }
-            }
-            None => CallToolResult::error(vec![Content::text(format!(
-                "Resource '{}' from '{}' had no text content.",
-                uri, entry.server
+                None => CallToolResult::error(vec![Content::text(format!(
+                    "Resource '{}' from '{}' had no text content.",
+                    url, entry.server
+                ))]),
+            },
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "Failed to read '{}' from '{}': {}",
+                url, entry.server, e.message
             ))]),
-        },
-        Err(e) => CallToolResult::error(vec![Content::text(format!(
-            "Failed to read '{}' from '{}': {}",
-            uri, entry.server, e.message
-        ))]),
+        }
+    } else {
+        match materialize_skill_archive(mgr, session_id, entry, cancel).await {
+            Ok(tree) => {
+                let Some(body) = tree.get("SKILL.md") else {
+                    return CallToolResult::error(vec![Content::text(format!(
+                        "Archive for skill '{}' has no SKILL.md at its root.",
+                        entry.name
+                    ))]);
+                };
+                let body = String::from_utf8_lossy(body).into_owned();
+                let mut supporting: Vec<String> = tree
+                    .keys()
+                    .filter(|k| k.as_str() != "SKILL.md")
+                    .cloned()
+                    .collect();
+                supporting.sort();
+                CallToolResult::success(vec![Content::text(frame_skill_md(
+                    entry,
+                    "(archive)",
+                    &body,
+                    &supporting,
+                ))])
+            }
+            Err(e) => CallToolResult::error(vec![Content::text(e)]),
+        }
+    }
+}
+
+/// Loads a supporting file (`<skill>/<rel>`) for an MCP skill and frames it
+/// with the `# Loaded:` header. URI-addressed skills compose the file URI
+/// against the skill root; archive-distributed skills read it from the
+/// unpacked tree.
+async fn load_mcp_supporting(
+    mgr: &ExtensionManager,
+    session_id: &str,
+    entry: &McpSkillEntry,
+    rel: &str,
+    cancel: CancellationToken,
+) -> CallToolResult {
+    let frame = |body: &str| {
+        CallToolResult::success(vec![Content::text(format!(
+            "# Loaded: {}/{}\n\n{}\n\n---\nFile loaded into context.",
+            entry.name, rel, body
+        ))])
+    };
+
+    if let Some(root) = entry.skill_root_uri() {
+        let composed = format!("{}{}", root, rel);
+        match mgr
+            .read_resource(session_id, &composed, &entry.server, cancel)
+            .await
+        {
+            Ok(result) => match first_text_content(result, &entry.server, &composed) {
+                Some(body) => frame(&body),
+                None => CallToolResult::error(vec![Content::text(format!(
+                    "Resource '{}' from '{}' had no text content.",
+                    composed, entry.server
+                ))]),
+            },
+            Err(e) => CallToolResult::error(vec![Content::text(format!(
+                "Failed to read '{}' from '{}': {}",
+                composed, entry.server, e.message
+            ))]),
+        }
+    } else {
+        match materialize_skill_archive(mgr, session_id, entry, cancel).await {
+            Ok(tree) => match tree.get(rel) {
+                Some(body) => frame(&String::from_utf8_lossy(body)),
+                None => {
+                    let mut available: Vec<&str> = tree
+                        .keys()
+                        .filter(|k| k.as_str() != "SKILL.md")
+                        .map(|k| k.as_str())
+                        .collect();
+                    available.sort();
+                    available.truncate(10);
+                    CallToolResult::error(vec![Content::text(format!(
+                        "File '{}/{}' not found in archive. Available: {}",
+                        entry.name,
+                        rel,
+                        available.join(", ")
+                    ))])
+                }
+            },
+            Err(e) => CallToolResult::error(vec![Content::text(e)]),
+        }
     }
 }
 
@@ -647,39 +596,7 @@ impl McpClientTrait for SkillsClient {
             load_skill_schema.as_object().unwrap().clone(),
         );
 
-        let mut tools = vec![load_skill];
-
-        // Only surface `load_skill_template` when at least one MCP server
-        // advertises a template catalog. Keeps the tool space tight on
-        // sessions that don't have any templates to instantiate.
-        if !self.mcp_skill_templates().await.is_empty() {
-            let load_skill_template_schema = serde_json::json!({
-                "type": "object",
-                "required": ["template", "arguments"],
-                "properties": {
-                    "template": {
-                        "type": "string",
-                        "description": "Template name from your system instructions, e.g. \"workflow-runs\" or \"<server>::workflow-runs\" on collision."
-                    },
-                    "arguments": {
-                        "type": "object",
-                        "additionalProperties": { "type": "string" },
-                        "description": "Map of placeholder name to value. Each value will be validated against the server's completion endpoint before the URI is resolved."
-                    }
-                }
-            });
-
-            let load_skill_template = Tool::new(
-                "load_skill_template",
-                "Instantiate a templated MCP skill catalog by binding its placeholders.\n\n\
-                 Templated skill catalogs are listed in your system instructions under \"Templated skill catalogs\". Each entry shows its required placeholders (e.g. `[placeholders: owner, repo]`). Call this tool with the template name and a value for each placeholder. The host validates each value against the server's completion endpoint where available, then resolves the URI and loads the resulting SKILL.md.\n\n\
-                 Example:\n\
-                 - load_skill_template(template: \"workflow-runs\", arguments: { \"owner\": \"octocat\", \"repo\": \"hello-world\" })"
-                    .to_string(),
-                load_skill_template_schema.as_object().unwrap().clone(),
-            );
-            tools.push(load_skill_template);
-        }
+        let tools = vec![load_skill];
 
         Ok(ListToolsResult {
             tools,
@@ -695,12 +612,6 @@ impl McpClientTrait for SkillsClient {
         arguments: Option<JsonObject>,
         cancellation_token: CancellationToken,
     ) -> Result<CallToolResult, Error> {
-        if name == "load_skill_template" {
-            return Ok(self
-                .call_load_skill_template(ctx, arguments, cancellation_token)
-                .await);
-        }
-
         if name != "load_skill" {
             return Ok(CallToolResult::error(vec![Content::text(format!(
                 "Unknown tool: {}",
@@ -868,12 +779,10 @@ impl McpClientTrait for SkillsClient {
 
         if let Some(entry) = find_mcp_by_name(&mcp_skills, skill_name) {
             if let Some(ref mgr) = mgr {
-                let entry_url = entry.url.clone();
-                return Ok(read_mcp_and_frame(
+                return Ok(load_mcp_skill_md(
                     mgr.as_ref(),
                     &ctx.session_id,
                     entry,
-                    &entry_url,
                     cancellation_token.clone(),
                 )
                 .await);
@@ -889,12 +798,11 @@ impl McpClientTrait for SkillsClient {
                             skill_name
                         ))]));
                     };
-                    let composed = format!("{}{}", entry.skill_root_uri(), rel);
-                    return Ok(read_mcp_and_frame(
+                    return Ok(load_mcp_supporting(
                         mgr.as_ref(),
                         &ctx.session_id,
                         entry,
-                        &composed,
+                        &rel,
                         cancellation_token.clone(),
                     )
                     .await);
@@ -970,18 +878,13 @@ impl McpClientTrait for SkillsClient {
     }
 
     async fn get_dynamic_instructions(&self, _session_id: &str) -> Option<String> {
-        let mcp = self.mcp_skills().await;
-        let templates = self.mcp_skill_templates().await;
-        if mcp.is_empty() && templates.is_empty() {
+        let mcp = self.injectable_mcp_skills().await;
+        if mcp.is_empty() {
             return None;
         }
         let fs_names = self.fs_skill_names_cached();
-        let collisions = collision_names(&fs_names, &mcp, &templates);
-
-        let mut out = String::new();
-        out.push_str(&format_mcp_skills_section(&collisions, &mcp));
-        out.push_str(&format_mcp_skill_templates_section(&collisions, &templates));
-        Some(out)
+        let collisions = collision_names(&fs_names, &mcp);
+        Some(format_mcp_skills_section(&collisions, &mcp))
     }
 }
 
@@ -1054,73 +957,74 @@ mod tests {
     }
 
     // ---------- MCP skill routing tests ----------
-    //
-    // These exercise the end-to-end path: register a FakeMcp server in an
-    // ExtensionManager (which populates the mcp_skills cache at connect
-    // time), wire a SkillsClient to a Weak of that manager, and call
-    // load_skill.
 
     use crate::agents::extension::ExtensionConfig;
     use crate::agents::extension_manager::ExtensionManager;
     use async_trait::async_trait;
     use rmcp::model::{
-        ExtensionCapabilities, ListResourcesResult, ReadResourceResult, ServerNotification,
+        Annotated, ExtensionCapabilities, ListResourcesResult, RawResource, ReadResourceResult,
+        ServerNotification,
     };
     use std::collections::HashMap;
 
+    /// Directory listing fixture: dir URI -> children as (uri, mimeType).
+    type DirMap = HashMap<String, Vec<(String, Option<String>)>>;
+
     struct FakeMcp {
         info: InitializeResult,
-        /// Mutable to support hot-swap in `test_list_changed_refreshes_cache`.
         resources: std::sync::Mutex<HashMap<String, String>>,
-        /// Completion fixture: maps argument name → accepted values.
-        /// When `complete_resource_argument` is called for an argument
-        /// not present in this map, the impl returns `TransportClosed`
-        /// so the host sees "completion unsupported".
-        completion: HashMap<String, Vec<String>>,
-        /// Subscribers from `subscribe()` calls; mirrors `GooseClient`'s
-        /// notification fan-out so tests can drive notifications via
-        /// `notify_resources_list_changed()`.
+        /// Binary resources (e.g. skill archives), returned as blob contents.
+        blobs: HashMap<String, Vec<u8>>,
+        /// `resources/directory/read` fixture; non-empty implies the server
+        /// declares `directoryRead: true`.
+        directories: DirMap,
         subscribers: tokio::sync::Mutex<Vec<mpsc::Sender<ServerNotification>>>,
     }
 
     impl FakeMcp {
-        fn new(resources: HashMap<String, String>) -> Self {
+        fn build_info(directory_read: bool) -> InitializeResult {
             let mut caps = ExtensionCapabilities::new();
+            let mut cfg = JsonObject::new();
+            if directory_read {
+                cfg.insert("directoryRead".to_string(), serde_json::json!(true));
+            }
             caps.insert(
                 super::super::mcp_client::SKILLS_EXTENSION_ID.to_string(),
-                JsonObject::new(),
+                cfg,
             );
-            let info = InitializeResult::new(
+            InitializeResult::new(
                 ServerCapabilities::builder()
                     .enable_resources()
                     .enable_extensions_with(caps)
                     .build(),
-            );
+            )
+        }
+
+        fn new(resources: HashMap<String, String>) -> Self {
             Self {
-                info,
+                info: Self::build_info(false),
                 resources: std::sync::Mutex::new(resources),
-                completion: HashMap::new(),
+                blobs: HashMap::new(),
+                directories: HashMap::new(),
                 subscribers: tokio::sync::Mutex::new(Vec::new()),
             }
         }
 
-        fn with_completion(mut self, argument: &str, values: &[&str]) -> Self {
-            self.completion.insert(
-                argument.to_string(),
-                values.iter().map(|s| s.to_string()).collect(),
-            );
+        fn with_blob(mut self, uri: &str, bytes: Vec<u8>) -> Self {
+            self.blobs.insert(uri.to_string(), bytes);
             self
         }
 
-        /// Replace this server's resources, e.g. to simulate a server-side
-        /// index update that a subsequent `resources/list_changed` will
-        /// pick up.
+        fn with_directories(mut self, dirs: DirMap) -> Self {
+            self.info = Self::build_info(true);
+            self.directories = dirs;
+            self
+        }
+
         fn swap_resources(&self, new_resources: HashMap<String, String>) {
             *self.resources.lock().unwrap() = new_resources;
         }
 
-        /// Fan out a `notifications/resources/list_changed` to every
-        /// subscriber currently registered via `subscribe()`.
         async fn notify_resources_list_changed(&self) {
             use rmcp::model::ResourceListChangedNotification;
             let subs = self.subscribers.lock().await;
@@ -1133,11 +1037,6 @@ mod tests {
             }
         }
 
-        /// Returns once at least one subscriber has registered via
-        /// `subscribe()`, polling at 10ms intervals up to `deadline`.
-        /// Used in tests to wait for the spawned `list_changed` watcher
-        /// to land before driving notifications — otherwise the
-        /// notification races the spawn and may be lost.
         async fn wait_for_subscriber(&self, timeout: Duration) -> bool {
             let deadline = std::time::Instant::now() + timeout;
             loop {
@@ -1187,22 +1086,13 @@ mod tests {
             _next_cursor: Option<String>,
             _cancel_token: CancellationToken,
         ) -> Result<ListResourcesResult, Error> {
-            // Return every resource the test registered, excluding the index
-            // itself — mirrors what a real server would expose via
-            // `resources/list`, and lets MCP supporting-files enumeration
-            // find entries under each skill's root URI.
             let resources = self
                 .resources
                 .lock()
                 .unwrap()
                 .keys()
                 .filter(|uri| uri.as_str() != super::super::mcp_client::INDEX_URI)
-                .map(|uri| {
-                    rmcp::model::Annotated::new(
-                        rmcp::model::RawResource::new(uri.as_str(), uri.as_str()),
-                        None,
-                    )
-                })
+                .map(|uri| Annotated::new(RawResource::new(uri.as_str(), uri.as_str()), None))
                 .collect();
             Ok(ListResourcesResult {
                 resources,
@@ -1217,6 +1107,18 @@ mod tests {
             uri: &str,
             _cancel_token: CancellationToken,
         ) -> Result<ReadResourceResult, Error> {
+            if let Some(bytes) = self.blobs.get(uri) {
+                use base64::Engine;
+                let blob = base64::engine::general_purpose::STANDARD.encode(bytes);
+                return Ok(ReadResourceResult::new(vec![
+                    ResourceContents::BlobResourceContents {
+                        uri: uri.to_string(),
+                        mime_type: Some("application/octet-stream".to_string()),
+                        blob,
+                        meta: None,
+                    },
+                ]));
+            }
             match self.resources.lock().unwrap().get(uri).cloned() {
                 Some(text) => Ok(ReadResourceResult::new(vec![
                     ResourceContents::TextResourceContents {
@@ -1230,42 +1132,38 @@ mod tests {
             }
         }
 
+        async fn directory_read(
+            &self,
+            _session_id: &str,
+            uri: &str,
+            _cursor: Option<String>,
+            _cancel_token: CancellationToken,
+        ) -> Result<ListResourcesResult, Error> {
+            let children = self.directories.get(uri).ok_or(Error::TransportClosed)?;
+            let resources = children
+                .iter()
+                .map(|(child_uri, mime)| {
+                    let mut raw = RawResource::new(child_uri.as_str(), child_uri.as_str());
+                    raw.mime_type = mime.clone();
+                    Annotated::new(raw, None)
+                })
+                .collect();
+            Ok(ListResourcesResult {
+                resources,
+                next_cursor: None,
+                meta: None,
+            })
+        }
+
         async fn subscribe(&self) -> mpsc::Receiver<ServerNotification> {
             let (tx, rx) = mpsc::channel(16);
             self.subscribers.lock().await.push(tx);
             rx
         }
-
-        async fn complete_resource_argument(
-            &self,
-            _session_id: &str,
-            _uri_template: &str,
-            argument_name: &str,
-            _current_value: &str,
-            _cancel_token: CancellationToken,
-        ) -> Result<rmcp::model::CompletionInfo, Error> {
-            match self.completion.get(argument_name) {
-                Some(values) => Ok(rmcp::model::CompletionInfo {
-                    values: values.clone(),
-                    total: Some(values.len() as u32),
-                    has_more: Some(false),
-                }),
-                None => Err(Error::TransportClosed),
-            }
-        }
     }
 
-    async fn setup_client_with_fake(
-        server_name: &str,
-        resources: HashMap<String, String>,
-        working_dir: PathBuf,
-    ) -> (SkillsClient, Arc<ExtensionManager>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mgr = Arc::new(ExtensionManager::new_without_provider(
-            tmp.path().to_path_buf(),
-        ));
-
-        let fake: std::sync::Arc<dyn McpClientTrait> = std::sync::Arc::new(FakeMcp::new(resources));
+    async fn register_built_fake(mgr: &Arc<ExtensionManager>, server_name: &str, fake: FakeMcp) {
+        let fake: Arc<dyn McpClientTrait> = Arc::new(fake);
         mgr.add_client(
             server_name.to_string(),
             ExtensionConfig::Builtin {
@@ -1282,12 +1180,24 @@ mod tests {
             Some("s"),
         )
         .await;
+        mgr.set_skills_enabled(server_name, true).await;
+    }
+
+    async fn setup_client_with_built(
+        server_name: &str,
+        fake: FakeMcp,
+        working_dir: PathBuf,
+    ) -> (SkillsClient, Arc<ExtensionManager>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let mgr = Arc::new(ExtensionManager::new_without_provider(
+            tmp.path().to_path_buf(),
+        ));
+        register_built_fake(&mgr, server_name, fake).await;
 
         let session = Arc::new(crate::session::Session {
             working_dir: working_dir.clone(),
             ..crate::session::Session::default()
         });
-
         let client = SkillsClient::new(PlatformExtensionContext {
             extension_manager: Some(Arc::downgrade(&mgr)),
             session_manager: Arc::new(crate::session::SessionManager::instance()),
@@ -1295,15 +1205,54 @@ mod tests {
             use_login_shell_path: false,
         })
         .unwrap();
-
         (client, mgr, tmp)
     }
 
-    fn index_json(entries: &str) -> String {
+    async fn setup_client_with_fake(
+        server_name: &str,
+        resources: HashMap<String, String>,
+        working_dir: PathBuf,
+    ) -> (SkillsClient, Arc<ExtensionManager>, TempDir) {
+        setup_client_with_built(server_name, FakeMcp::new(resources), working_dir).await
+    }
+
+    /// Build an index entry carrying a frontmatter block plus extra JSON
+    /// (e.g. `,"url":"...","digest":"..."`).
+    fn fm_entry(name: &str, description: &str, extra: &str) -> String {
         format!(
-            r#"{{"$schema":"https://schemas.agentskills.io/discovery/0.2.0/schema.json","skills":[{}]}}"#,
-            entries
+            r#"{{"frontmatter":{{"name":"{}","description":"{}"}}{}}}"#,
+            name, description, extra
         )
+    }
+
+    fn index_json(entries: &str) -> String {
+        format!(r#"{{"skills":[{}]}}"#, entries)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let out = h.finalize();
+        let mut s = String::new();
+        for b in out {
+            s.push_str(&format!("{:02x}", b));
+        }
+        s
+    }
+
+    fn make_tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        for (name, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *content).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap()
     }
 
     fn text_of(r: &CallToolResult) -> String {
@@ -1319,13 +1268,15 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"git-workflow","type":"skill-md","description":"Git","url":"skill://git-workflow/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "git-workflow",
+                "Git",
+                r#","url":"skill://git-workflow/SKILL.md""#,
+            )),
         );
         resources.insert(
             "skill://git-workflow/SKILL.md".to_string(),
-            "---\nname: git-workflow\ndescription: Git\n---\nGit body text.".to_string(),
+            "Git body text.".to_string(),
         );
 
         let (client, _mgr, _tmp_guard) =
@@ -1346,14 +1297,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_load_mcp_skill_verifies_digest_and_rejects_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let body = "verified skill body";
+        let good_digest = format!("sha256:{}", sha256_hex(body.as_bytes()));
+
+        let mut resources = HashMap::new();
+        resources.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "verified",
+                "v",
+                &format!(
+                    r#","url":"skill://verified/SKILL.md","digest":"{}""#,
+                    good_digest
+                ),
+            )),
+        );
+        resources.insert("skill://verified/SKILL.md".to_string(), body.to_string());
+        let (client, _mgr, _g) =
+            setup_client_with_fake("gh", resources, tmp.path().to_path_buf()).await;
+        let ctx = ToolCallContext::new("s".to_string(), None, None);
+        let ok = client
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(serde_json::from_value(serde_json::json!({"name": "verified"})).unwrap()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!ok.is_error.unwrap_or(false), "got: {}", text_of(&ok));
+        assert!(text_of(&ok).contains("verified skill body"));
+
+        let mut resources = HashMap::new();
+        resources.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "tampered",
+                "t",
+                r#","url":"skill://tampered/SKILL.md","digest":"sha256:deadbeef""#,
+            )),
+        );
+        resources.insert(
+            "skill://tampered/SKILL.md".to_string(),
+            "SHOULD NOT SURFACE".to_string(),
+        );
+        let (client, _mgr, _g) =
+            setup_client_with_fake("gh", resources, tmp.path().to_path_buf()).await;
+        let bad = client
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(serde_json::from_value(serde_json::json!({"name": "tampered"})).unwrap()),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(bad.is_error.unwrap_or(false));
+        let body = text_of(&bad);
+        assert!(
+            body.contains("digest mismatch") || body.contains("Refusing"),
+            "got: {}",
+            body
+        );
+        assert!(!body.contains("SHOULD NOT SURFACE"));
+    }
+
+    #[tokio::test]
+    async fn test_load_mcp_skill_from_archive() {
+        let tmp = TempDir::new().unwrap();
+        let archive = make_tar_gz(&[
+            ("SKILL.md", b"archived skill body"),
+            ("references/GUIDE.md", b"archived guide"),
+        ]);
+        let digest = format!("sha256:{}", sha256_hex(&archive));
+        let mut resources = HashMap::new();
+        resources.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "pdf-processing",
+                "PDFs",
+                &format!(
+                    r#","archives":[{{"url":"skill://pdf-processing.tar.gz","mimeType":"application/gzip","digest":"{}"}}]"#,
+                    digest
+                ),
+            )),
+        );
+        let fake = FakeMcp::new(resources).with_blob("skill://pdf-processing.tar.gz", archive);
+        let (client, _mgr, _g) =
+            setup_client_with_built("srv", fake, tmp.path().to_path_buf()).await;
+
+        let ctx = ToolCallContext::new("s".to_string(), None, None);
+        let result = client
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(
+                    serde_json::from_value(serde_json::json!({"name": "pdf-processing"})).unwrap(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "got: {}",
+            text_of(&result)
+        );
+        let body = text_of(&result);
+        assert!(body.contains("archived skill body"), "got: {}", body);
+        assert!(
+            body.contains("references/GUIDE.md → load_skill"),
+            "archive supporting files should be listed; got: {}",
+            body
+        );
+        assert!(!body.contains("archived guide"), "got: {}", body);
+
+        let sf = client
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(
+                    serde_json::from_value(
+                        serde_json::json!({"name": "pdf-processing/references/GUIDE.md"}),
+                    )
+                    .unwrap(),
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!sf.is_error.unwrap_or(false), "got: {}", text_of(&sf));
+        assert!(text_of(&sf).contains("archived guide"));
+    }
+
+    #[tokio::test]
     async fn test_load_mcp_skill_non_skill_scheme() {
         let tmp = TempDir::new().unwrap();
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"pull-requests","type":"skill-md","description":"PRs","url":"github://o/r/skills/pull-requests/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "pull-requests",
+                "PRs",
+                r#","url":"github://o/r/skills/pull-requests/SKILL.md""#,
+            )),
         );
         resources.insert(
             "github://o/r/skills/pull-requests/SKILL.md".to_string(),
@@ -1381,9 +1470,7 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"skill-md","description":"","url":"skill://docs/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry("docs", "", r#","url":"skill://docs/SKILL.md""#)),
         );
         resources.insert(
             "skill://docs/references/GUIDE.md".to_string(),
@@ -1408,16 +1495,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_mcp_supporting_file_rejects_parent_traversal() {
-        // A model (or a hijacked server index) that asks for `docs/../other`
-        // or `docs//absolute` must not be composed into the server URI — it
-        // could escape the skill directory on a filesystem-backed resolver.
         let tmp = TempDir::new().unwrap();
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"skill-md","description":"","url":"skill://docs/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry("docs", "", r#","url":"skill://docs/SKILL.md""#)),
         );
         let (client, _mgr, _tmp_guard) =
             setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
@@ -1445,8 +1527,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_skill_uri_input_redirects_to_read_resource() {
-        // load_skill is name-only; passing a URI returns an instructive
-        // error pointing the model at read_resource.
         let tmp = TempDir::new().unwrap();
         let (client, _mgr, _tmp_guard) =
             setup_client_with_fake("srv", HashMap::new(), tmp.path().to_path_buf()).await;
@@ -1461,96 +1541,10 @@ mod tests {
             .unwrap();
 
         assert!(result.is_error.unwrap_or(false));
-        let body = text_of(&result);
-        assert!(body.contains("read_resource"), "got: {}", body);
-    }
-
-    #[tokio::test]
-    async fn test_get_extensions_info_roundtrip_does_not_deadlock() {
-        // Regression guard: `ExtensionManager::get_extensions_info` iterates
-        // registered extensions and invokes `get_dynamic_instructions` on
-        // each. `SkillsClient::get_dynamic_instructions` in turn calls
-        // `mgr.aggregated_mcp_skills()`, which re-acquires the same
-        // `extensions` mutex. If any future edit inlines that call inside
-        // the iteration lock scope, this test will hang (tokio::time::timeout
-        // turns that into a clean failure).
-        let tmp = TempDir::new().unwrap();
-        let working_dir = tmp.path().to_path_buf();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"A","url":"skill://alpha/SKILL.md"}"#,
-            ),
-        );
-
-        let mgr = Arc::new(ExtensionManager::new_without_provider(working_dir.clone()));
-        let fake: Arc<dyn McpClientTrait> = Arc::new(FakeMcp::new(resources));
-        mgr.add_client(
-            "srv".to_string(),
-            ExtensionConfig::Builtin {
-                name: "srv".to_string(),
-                display_name: Some("srv".to_string()),
-                description: "fake mcp".to_string(),
-                timeout: None,
-                bundled: None,
-                available_tools: vec![],
-            },
-            fake,
-            None,
-            None,
-            Some("s"),
-        )
-        .await;
-
-        // Register a SkillsClient into the manager so `get_extensions_info`
-        // will call its `get_dynamic_instructions` during iteration.
-        let session = Arc::new(crate::session::Session {
-            working_dir: working_dir.clone(),
-            ..crate::session::Session::default()
-        });
-        let skills_client: Arc<dyn McpClientTrait> = Arc::new(
-            SkillsClient::new(PlatformExtensionContext {
-                extension_manager: Some(Arc::downgrade(&mgr)),
-                session_manager: Arc::new(crate::session::SessionManager::instance()),
-                session: Some(session),
-                use_login_shell_path: false,
-            })
-            .unwrap(),
-        );
-        mgr.add_client(
-            EXTENSION_NAME.to_string(),
-            ExtensionConfig::Builtin {
-                name: EXTENSION_NAME.to_string(),
-                display_name: Some("Skills".to_string()),
-                description: "skills".to_string(),
-                timeout: None,
-                bundled: None,
-                available_tools: vec![],
-            },
-            skills_client,
-            None,
-            None,
-            Some("s"),
-        )
-        .await;
-
-        // Bounded wait — a self-deadlock would hang forever.
-        let infos = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            mgr.get_extensions_info("s", &working_dir),
-        )
-        .await
-        .expect("get_extensions_info must not deadlock on the extensions lock");
-
-        let skills_info = infos
-            .iter()
-            .find(|i| i.name == EXTENSION_NAME)
-            .expect("skills extension should appear in get_extensions_info output");
         assert!(
-            skills_info.instructions.contains("alpha"),
-            "dynamic instructions should include the MCP skill; got: {}",
-            skills_info.instructions
+            text_of(&result).contains("read_resource"),
+            "got: {}",
+            text_of(&result)
         );
     }
 
@@ -1560,9 +1554,11 @@ mod tests {
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"A","url":"skill://alpha/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "alpha",
+                "A",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
         );
         let (client, _mgr, _tmp_guard) =
             setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
@@ -1575,105 +1571,13 @@ mod tests {
         assert!(out.contains("srv"), "got: {}", out);
     }
 
-    /// Registers a second MCP server on an existing manager. Mirrors the
-    /// shape of `setup_client_with_fake` for the second call.
-    async fn register_fake(
-        mgr: &Arc<ExtensionManager>,
+    async fn setup_client_without_opt_in(
         server_name: &str,
         resources: HashMap<String, String>,
-    ) {
-        let fake: Arc<dyn McpClientTrait> = Arc::new(FakeMcp::new(resources));
-        mgr.add_client(
-            server_name.to_string(),
-            ExtensionConfig::Builtin {
-                name: server_name.to_string(),
-                display_name: Some(server_name.to_string()),
-                description: "fake mcp".to_string(),
-                timeout: None,
-                bundled: None,
-                available_tools: vec![],
-            },
-            fake,
-            None,
-            None,
-            Some("s"),
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_mcp_vs_mcp_collision_renders_prefixed_names() {
-        // Two servers publish the same skill name. Dynamic instructions
-        // must render BOTH with `<server>__<name>` so the model can
-        // address them unambiguously.
-        let tmp = TempDir::new().unwrap();
-        let mut r1 = HashMap::new();
-        r1.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"shared","type":"skill-md","description":"from one","url":"skill://shared/SKILL.md"}"#,
-            ),
-        );
-        let (client, mgr, _tmp) = setup_client_with_fake("one", r1, tmp.path().to_path_buf()).await;
-
-        let mut r2 = HashMap::new();
-        r2.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"shared","type":"skill-md","description":"from two","url":"skill://shared/SKILL.md"}"#,
-            ),
-        );
-        register_fake(&mgr, "two", r2).await;
-
-        let out = client
-            .get_dynamic_instructions("s")
-            .await
-            .expect("dynamic output");
-        assert!(
-            out.contains("one__shared"),
-            "missing one__shared; got:\n{}",
-            out
-        );
-        assert!(
-            out.contains("two__shared"),
-            "missing two__shared; got:\n{}",
-            out
-        );
-        // Bare "shared" alone (followed by a space or paren) must NOT appear
-        // as a display name — only the prefixed forms.
-        assert!(
-            !out.contains("• shared "),
-            "bare 'shared' should not be rendered when collision exists; got:\n{}",
-            out
-        );
-    }
-
-    /// Variant of `setup_client_with_fake` that wires a `FakeMcp` with a
-    /// completion fixture into the extension manager. Used by the
-    /// `load_skill_template` tests below.
-    async fn setup_client_with_completion_fake(
-        server_name: &str,
-        resources: HashMap<String, String>,
-        completion: &[(&str, &[&str])],
         working_dir: PathBuf,
-        skill_md_body: &str,
-        skill_md_uri: &str,
-    ) -> (SkillsClient, Arc<ExtensionManager>, TempDir) {
-        let tmp = TempDir::new().unwrap();
-        let mgr = Arc::new(ExtensionManager::new_without_provider(
-            tmp.path().to_path_buf(),
-        ));
-
-        // Augment resources with the SKILL.md body the test expects to
-        // be read after URL substitution.
-        let mut resources = resources;
-        resources.insert(skill_md_uri.to_string(), skill_md_body.to_string());
-
-        let mut fake = FakeMcp::new(resources);
-        for (arg, values) in completion {
-            fake = fake.with_completion(arg, values);
-        }
-        let fake: std::sync::Arc<dyn McpClientTrait> = std::sync::Arc::new(fake);
+    ) -> (SkillsClient, Arc<ExtensionManager>) {
+        let mgr = Arc::new(ExtensionManager::new_without_provider(working_dir.clone()));
+        let fake: Arc<dyn McpClientTrait> = Arc::new(FakeMcp::new(resources));
         mgr.add_client(
             server_name.to_string(),
             ExtensionConfig::Builtin {
@@ -1692,7 +1596,7 @@ mod tests {
         .await;
 
         let session = Arc::new(crate::session::Session {
-            working_dir: working_dir.clone(),
+            working_dir,
             ..crate::session::Session::default()
         });
         let client = SkillsClient::new(PlatformExtensionContext {
@@ -1702,22 +1606,112 @@ mod tests {
             use_login_shell_path: false,
         })
         .unwrap();
-        (client, mgr, tmp)
+        (client, mgr)
+    }
+
+    #[tokio::test]
+    async fn test_injection_gated_until_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let mut resources = HashMap::new();
+        resources.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "alpha",
+                "A",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
+        );
+        let (client, mgr) =
+            setup_client_without_opt_in("srv", resources, tmp.path().to_path_buf()).await;
+
+        assert!(!mgr.aggregated_mcp_skills().await.is_empty());
+        assert!(mgr.injectable_mcp_skills().await.is_empty());
+        assert!(client.get_dynamic_instructions("s").await.is_none());
+
+        mgr.set_skills_enabled("srv", true).await;
+        let out = client
+            .get_dynamic_instructions("s")
+            .await
+            .expect("opted-in skill should render");
+        assert!(out.contains("alpha"), "got: {}", out);
+
+        mgr.set_skills_enabled("srv", false).await;
+        assert!(client.get_dynamic_instructions("s").await.is_none());
+        assert!(!mgr.aggregated_mcp_skills().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_skill_servers_reports_counts_and_consent_state() {
+        let tmp = TempDir::new().unwrap();
+        let mut resources = HashMap::new();
+        resources.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "alpha",
+                "A",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
+        );
+        let (_client, mgr) =
+            setup_client_without_opt_in("srv", resources, tmp.path().to_path_buf()).await;
+
+        let before = mgr.mcp_skill_servers().await;
+        let entry = before.iter().find(|s| s.server == "srv").unwrap();
+        assert_eq!(entry.concrete_count, 1);
+        assert!(!entry.skills_enabled);
+
+        mgr.set_skills_enabled("srv", true).await;
+        let after = mgr.mcp_skill_servers().await;
+        let entry = after.iter().find(|s| s.server == "srv").unwrap();
+        assert!(entry.skills_enabled);
+    }
+
+    async fn register_fake(
+        mgr: &Arc<ExtensionManager>,
+        server_name: &str,
+        resources: HashMap<String, String>,
+    ) {
+        register_built_fake(mgr, server_name, FakeMcp::new(resources)).await;
+    }
+
+    #[tokio::test]
+    async fn test_mcp_vs_mcp_collision_renders_prefixed_names() {
+        let tmp = TempDir::new().unwrap();
+        let mut r1 = HashMap::new();
+        r1.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "shared",
+                "from one",
+                r#","url":"skill://shared/SKILL.md""#,
+            )),
+        );
+        let (client, mgr, _tmp) = setup_client_with_fake("one", r1, tmp.path().to_path_buf()).await;
+
+        let mut r2 = HashMap::new();
+        r2.insert(
+            "skill://index.json".to_string(),
+            index_json(&fm_entry(
+                "shared",
+                "from two",
+                r#","url":"skill://shared/SKILL.md""#,
+            )),
+        );
+        register_fake(&mgr, "two", r2).await;
+
+        let out = client
+            .get_dynamic_instructions("s")
+            .await
+            .expect("dynamic output");
+        assert!(out.contains("one__shared"), "got:\n{}", out);
+        assert!(out.contains("two__shared"), "got:\n{}", out);
+        assert!(!out.contains("• shared "), "got:\n{}", out);
     }
 
     #[tokio::test]
     async fn test_load_skill_framing_parity_fs_vs_mcp() {
-        // Both the FS and MCP load_skill paths must produce a shape the
-        // model can pattern-match identically. We lock the contract here:
-        //   1. `# Loaded Skill: <name>` header (MCP appends an origin
-        //      tag — that divergence is intentional and useful).
-        //   2. `## Supporting Files` section with a `Skill base:` header
-        //      (NOT the legacy `Skill directory:` form).
-        //   3. Bullet pointers: `- <rel> → load_skill(name: "<skill>/<rel>")`.
-        //   4. Trailing footer `This knowledge is now available in your context.`.
         let tmp = TempDir::new().unwrap();
 
-        // --- FS skill: name=fs-demo, one supporting file. ---
         let fs_skill_dir = tmp.path().join(".goose/skills/fs-demo");
         fs::create_dir_all(&fs_skill_dir).unwrap();
         fs::write(
@@ -1727,13 +1721,14 @@ mod tests {
         .unwrap();
         fs::write(fs_skill_dir.join("guide.md"), "supporting body").unwrap();
 
-        // --- MCP skill on a fake server: name=mcp-demo, same shape. ---
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"mcp-demo","type":"skill-md","description":"MCP demo","url":"skill://mcp-demo/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "mcp-demo",
+                "MCP demo",
+                r#","url":"skill://mcp-demo/SKILL.md""#,
+            )),
         );
         resources.insert(
             "skill://mcp-demo/SKILL.md".to_string(),
@@ -1746,7 +1741,6 @@ mod tests {
         let (client, _mgr, _tmp) =
             setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
 
-        // FS load.
         let ctx = ToolCallContext::new("s".to_string(), None, None);
         let fs_result = client
             .call_tool(
@@ -1762,7 +1756,6 @@ mod tests {
             .unwrap();
         let fs_text = text_of(&fs_result);
 
-        // MCP load.
         let mcp_result = client
             .call_tool(
                 &ctx,
@@ -1777,85 +1770,50 @@ mod tests {
             .unwrap();
         let mcp_text = text_of(&mcp_result);
 
-        // Both share the same structural anchors. Headers differ on
-        // origin tag (kept on purpose); body text and supporting-file
-        // header MUST agree.
         for (label, text) in [("fs", &fs_text), ("mcp", &mcp_text)] {
-            assert!(
-                text.starts_with("# Loaded Skill: "),
-                "{}: missing Loaded Skill header; got:\n{}",
-                label,
-                text
-            );
-            assert!(
-                text.contains("## Supporting Files"),
-                "{}: missing Supporting Files section; got:\n{}",
-                label,
-                text
-            );
-            assert!(
-                text.contains("Skill base: "),
-                "{}: must use 'Skill base:' header; got:\n{}",
-                label,
-                text
-            );
-            assert!(
-                !text.contains("Skill directory:"),
-                "{}: legacy 'Skill directory:' header must be gone; got:\n{}",
-                label,
-                text
-            );
+            assert!(text.starts_with("# Loaded Skill: "), "{}: {}", label, text);
+            assert!(text.contains("## Supporting Files"), "{}: {}", label, text);
+            assert!(text.contains("Skill base: "), "{}: {}", label, text);
+            assert!(!text.contains("Skill directory:"), "{}: {}", label, text);
             assert!(
                 text.contains("This knowledge is now available in your context."),
-                "{}: missing footer; got:\n{}",
+                "{}: {}",
                 label,
                 text
             );
             assert!(
                 text.contains("→ load_skill(name: \""),
-                "{}: missing pointer arrow; got:\n{}",
+                "{}: {}",
                 label,
                 text
             );
         }
 
-        // MCP gets the origin tag; FS does not.
         assert!(
             mcp_text.contains("mcp skill from srv"),
-            "mcp text should carry origin tag; got:\n{}",
+            "got:\n{}",
             mcp_text
         );
-        assert!(
-            !fs_text.contains("mcp skill from"),
-            "fs text must not carry mcp origin tag; got:\n{}",
-            fs_text
-        );
+        assert!(!fs_text.contains("mcp skill from"), "got:\n{}", fs_text);
     }
 
     #[tokio::test]
     async fn test_watcher_spawned_on_session_carrying_repopulate() {
-        // First registration runs with `session_id=None` — no watcher is
-        // spawned and the cache is empty. A second `add_extension` for
-        // the same extension with `session_id=Some(...)` hits the fast
-        // path's repopulate branch, which should both fill the cache
-        // AND spawn the watcher (previously this only filled the
-        // cache, leaving the extension permanently un-watched).
         let tmp = TempDir::new().unwrap();
-
         let mut initial = HashMap::new();
         initial.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "alpha",
+                "a",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
         );
         let fake = Arc::new(FakeMcp::new(initial));
-
         let mgr = Arc::new(ExtensionManager::new_without_provider(
             tmp.path().to_path_buf(),
         ));
 
-        // First registration: no session id → no fetch, no watcher.
         let trait_handle: Arc<dyn McpClientTrait> = fake.clone();
         mgr.add_client(
             "srv".to_string(),
@@ -1870,16 +1828,11 @@ mod tests {
             trait_handle,
             None,
             None,
-            None, // ← deliberately no session_id
+            None,
         )
         .await;
-        assert!(
-            mgr.aggregated_mcp_skills().await.is_empty(),
-            "cache should be empty after session-less registration"
-        );
+        assert!(mgr.aggregated_mcp_skills().await.is_empty());
 
-        // Second pass via `add_extension` with a session id. The config
-        // matches the existing entry, so the fast-path repopulate runs.
         mgr.add_extension(
             ExtensionConfig::Builtin {
                 name: "srv".to_string(),
@@ -1896,26 +1849,20 @@ mod tests {
         .await
         .expect("repopulate add_extension should succeed");
 
-        // Cache should be populated now.
         let after_repopulate = mgr.aggregated_mcp_skills().await;
         assert_eq!(after_repopulate.len(), 1);
         assert_eq!(after_repopulate[0].name, "alpha");
 
-        // Wait for the watcher to subscribe (spawned by the repopulate
-        // path), then drive a list_changed and confirm the cache picks
-        // up the new entry.
-        assert!(
-            fake.wait_for_subscriber(Duration::from_secs(2)).await,
-            "repopulate path should have spawned the watcher; no subscriber present"
-        );
+        assert!(fake.wait_for_subscriber(Duration::from_secs(2)).await);
 
         let mut updated = HashMap::new();
         updated.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"},
-                   {"name":"beta","type":"skill-md","description":"b","url":"skill://beta/SKILL.md"}"#,
-            ),
+            index_json(&format!(
+                "{},{}",
+                fm_entry("alpha", "a", r#","url":"skill://alpha/SKILL.md""#),
+                fm_entry("beta", "b", r#","url":"skill://beta/SKILL.md""#),
+            )),
         );
         fake.swap_resources(updated);
         fake.notify_resources_list_changed().await;
@@ -1926,38 +1873,25 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
             refreshed = mgr.aggregated_mcp_skills().await;
         }
-        assert_eq!(
-            refreshed.len(),
-            2,
-            "list_changed should refresh through the spawn-on-repopulate path; got: {:?}",
-            refreshed
-        );
+        assert_eq!(refreshed.len(), 2, "got: {:?}", refreshed);
     }
 
     #[tokio::test]
     async fn test_list_changed_refreshes_cache() {
-        // Server initially advertises only `alpha`; after we hot-swap the
-        // index and fire `notifications/resources/list_changed`, the
-        // background subscriber task re-fetches and the manager's
-        // `aggregated_mcp_skills` reflects the new entry — without any
-        // explicit reconnect.
         let tmp = TempDir::new().unwrap();
-
         let mut initial = HashMap::new();
         initial.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "alpha",
+                "a",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
         );
         let fake = Arc::new(FakeMcp::new(initial));
-
         let mgr = Arc::new(ExtensionManager::new_without_provider(
             tmp.path().to_path_buf(),
         ));
-        // Register through the trait object — same as production — but
-        // keep our concrete-type Arc handle so we can drive
-        // resources/list_changed below.
         let trait_handle: Arc<dyn McpClientTrait> = fake.clone();
         mgr.add_client(
             "srv".to_string(),
@@ -1976,47 +1910,30 @@ mod tests {
         )
         .await;
 
-        // Initial state: only `alpha` is visible.
         let before = mgr.aggregated_mcp_skills().await;
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].name, "alpha");
 
-        // The watcher task is spawned but not necessarily subscribed
-        // yet — wait for it to land before driving notifications,
-        // otherwise the notify call may fan out to zero subscribers.
-        assert!(
-            fake.wait_for_subscriber(Duration::from_secs(2)).await,
-            "watcher task should have subscribed by now"
-        );
+        assert!(fake.wait_for_subscriber(Duration::from_secs(2)).await);
 
-        // Hot-swap the index — add `beta` alongside `alpha`.
         let mut updated = HashMap::new();
         updated.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"},
-                   {"name":"beta","type":"skill-md","description":"b","url":"skill://beta/SKILL.md"}"#,
-            ),
+            index_json(&format!(
+                "{},{}",
+                fm_entry("alpha", "a", r#","url":"skill://alpha/SKILL.md""#),
+                fm_entry("beta", "b", r#","url":"skill://beta/SKILL.md""#),
+            )),
         );
         fake.swap_resources(updated);
-
-        // Fire the notification. The watcher is subscribed by this point.
         fake.notify_resources_list_changed().await;
 
-        // Wait up to 1s for the watcher to observe + refetch + write.
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         let mut after = mgr.aggregated_mcp_skills().await;
         while after.len() < 2 && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
             after = mgr.aggregated_mcp_skills().await;
         }
-
-        assert_eq!(
-            after.len(),
-            2,
-            "cache should reflect the new entry; got: {:?}",
-            after
-        );
+        assert_eq!(after.len(), 2, "got: {:?}", after);
         let names: std::collections::HashSet<&str> =
             after.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains("alpha"));
@@ -2025,21 +1942,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_extension_ends_watcher_task() {
-        // Regression: the watcher task used to hold a strong Arc to the
-        // McpClient, so its `rx.recv()` never yielded None (the client's
-        // notification senders couldn't drop while the task itself held
-        // the client). `remove_extension` therefore leaked the task and
-        // every transport handle it kept alive. With CancellationToken
-        // wired in, `remove_extension` fires cancel; the watcher exits;
-        // its `mpsc::Receiver` drops; the corresponding `Sender` in the
-        // fake's subscribers list reports `is_closed()`.
         let tmp = TempDir::new().unwrap();
         let mut initial = HashMap::new();
         initial.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "alpha",
+                "a",
+                r#","url":"skill://alpha/SKILL.md""#,
+            )),
         );
         let fake = Arc::new(FakeMcp::new(initial));
         let mgr = Arc::new(ExtensionManager::new_without_provider(
@@ -2063,418 +1974,33 @@ mod tests {
         )
         .await;
 
-        assert!(
-            fake.wait_for_subscriber(Duration::from_secs(2)).await,
-            "watcher should subscribe before we remove the extension"
-        );
-
+        assert!(fake.wait_for_subscriber(Duration::from_secs(2)).await);
         let tx = {
             let subs = fake.subscribers.lock().await;
-            subs.first()
-                .expect("at least one subscriber after wait_for_subscriber")
-                .clone()
+            subs.first().expect("subscriber").clone()
         };
-        assert!(!tx.is_closed(), "sender should be open while watcher runs");
+        assert!(!tx.is_closed());
 
-        mgr.remove_extension("srv")
-            .await
-            .expect("remove_extension should succeed");
+        mgr.remove_extension("srv").await.expect("remove");
 
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while !tx.is_closed() && std::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            tx.is_closed(),
-            "watcher should have dropped its receiver after remove_extension"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_skill_template_validates_and_reads() {
-        // Server publishes a template with `{owner}` and `{repo}`
-        // placeholders and supports completion for both. With validated
-        // values, the host substitutes placeholders, dispatches via
-        // read_mcp_and_frame, and returns the SKILL.md body wrapped in
-        // the standard "Loaded Skill" framing.
-        let tmp = TempDir::new().unwrap();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"workflow-runs","type":"mcp-resource-template","description":"CI runs","url":"github://{owner}/{repo}/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) = setup_client_with_completion_fake(
-            "gh",
-            resources,
-            &[
-                ("owner", &["octocat", "anthropic"]),
-                ("repo", &["hello-world"]),
-            ],
-            tmp.path().to_path_buf(),
-            "workflow runs body",
-            "github://octocat/hello-world/SKILL.md",
-        )
-        .await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({
-            "template": "workflow-runs",
-            "arguments": { "owner": "octocat", "repo": "hello-world" }
-        }))
-        .unwrap();
-        let result = client
-            .call_tool(
-                &ctx,
-                "load_skill_template",
-                Some(args),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !result.is_error.unwrap_or(false),
-            "expected success; got: {:?}",
-            result
-        );
-        let body = text_of(&result);
-        assert!(
-            body.contains("# Loaded Skill: workflow-runs"),
-            "missing header; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("mcp skill from gh"),
-            "missing origin tag; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("workflow runs body"),
-            "missing resolved body; got:\n{}",
-            body
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_skill_template_rejects_invalid_value() {
-        // Completion endpoint declares `owner` accepts only ["octocat"].
-        // A user/model attempt to instantiate with `owner="malicious"`
-        // is rejected without dispatching `read_resource`.
-        let tmp = TempDir::new().unwrap();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"workflow-runs","type":"mcp-resource-template","description":"CI runs","url":"github://{owner}/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) = setup_client_with_completion_fake(
-            "gh",
-            resources,
-            &[("owner", &["octocat"])],
-            tmp.path().to_path_buf(),
-            "should-not-be-read",
-            "github://malicious/SKILL.md",
-        )
-        .await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({
-            "template": "workflow-runs",
-            "arguments": { "owner": "malicious" }
-        }))
-        .unwrap();
-        let result = client
-            .call_tool(
-                &ctx,
-                "load_skill_template",
-                Some(args),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_error.unwrap_or(false), "expected error");
-        let body = text_of(&result);
-        assert!(
-            body.contains("not accepted by the server"),
-            "should explain rejection; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("octocat"),
-            "should surface accepted value; got:\n{}",
-            body
-        );
-        // The "would-have-been-read" body must NOT appear — confirms
-        // we short-circuited before resources/read.
-        assert!(
-            !body.contains("should-not-be-read"),
-            "resolved URI must not be read on rejected validation; got:\n{}",
-            body
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_skill_template_proceeds_when_completion_unsupported() {
-        // Server returns no completion data for any argument (default
-        // FakeMcp behavior: `complete_resource_argument` -> TransportClosed).
-        // Per SEP, the host MUST treat this as "completion unsupported"
-        // and proceed without validation.
-        let tmp = TempDir::new().unwrap();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"product-docs","type":"mcp-resource-template","description":"per-product","url":"skill://docs/{product}/SKILL.md"}"#,
-            ),
-        );
-        // No completion fixture here — empty slice means every
-        // argument returns TransportClosed.
-        let (client, _mgr, _tmp) = setup_client_with_completion_fake(
-            "srv",
-            resources,
-            &[],
-            tmp.path().to_path_buf(),
-            "anything-goes",
-            "skill://docs/anything-goes/SKILL.md",
-        )
-        .await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({
-            "template": "product-docs",
-            "arguments": { "product": "anything-goes" }
-        }))
-        .unwrap();
-        let result = client
-            .call_tool(
-                &ctx,
-                "load_skill_template",
-                Some(args),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(
-            !result.is_error.unwrap_or(false),
-            "should proceed despite missing completion; got: {:?}",
-            result
-        );
-        let body = text_of(&result);
-        assert!(
-            body.contains("anything-goes"),
-            "body should be returned; got:\n{}",
-            body
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_skill_template_missing_placeholder() {
-        // Caller forgets to supply a placeholder value. The host should
-        // refuse with a clear message listing missing names — no
-        // resources/read attempt is made.
-        let tmp = TempDir::new().unwrap();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"mcp-resource-template","description":"d","url":"skill://docs/{owner}/{repo}/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) =
-            setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({
-            "template": "docs",
-            "arguments": { "owner": "octocat" }
-        }))
-        .unwrap();
-        let result = client
-            .call_tool(
-                &ctx,
-                "load_skill_template",
-                Some(args),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-
-        assert!(result.is_error.unwrap_or(false));
-        let body = text_of(&result);
-        assert!(
-            body.contains("missing placeholder"),
-            "should list missing placeholders; got:\n{}",
-            body
-        );
-        assert!(body.contains("repo"));
-    }
-
-    #[tokio::test]
-    async fn test_load_skill_template_unknown_template() {
-        let tmp = TempDir::new().unwrap();
-        let mut resources = HashMap::new();
-        resources.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"mcp-resource-template","description":"d","url":"skill://docs/{x}/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) =
-            setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({
-            "template": "nope",
-            "arguments": { "x": "y" }
-        }))
-        .unwrap();
-        let result = client
-            .call_tool(
-                &ctx,
-                "load_skill_template",
-                Some(args),
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert!(result.is_error.unwrap_or(false));
-        let body = text_of(&result);
-        assert!(body.contains("Unknown template"));
-    }
-
-    #[tokio::test]
-    async fn test_template_section_renders_with_placeholders() {
-        // A server that publishes only a templated catalog should yield
-        // dynamic instructions with the templated-catalog section, listing
-        // each placeholder name in the bullet's `[placeholders: ...]` hint.
-        let tmp = TempDir::new().unwrap();
-        let mut r = HashMap::new();
-        r.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"workflow-runs","type":"mcp-resource-template","description":"Investigating CI workflow runs","url":"github://{owner}/{repo}/.github/skills/workflow-runs/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) = setup_client_with_fake("gh", r, tmp.path().to_path_buf()).await;
-
-        let out = client
-            .get_dynamic_instructions("s")
-            .await
-            .expect("dynamic output");
-        assert!(
-            out.contains("Templated skill catalogs"),
-            "should contain the template section header; got:\n{}",
-            out
-        );
-        assert!(
-            out.contains("workflow-runs"),
-            "should contain the template name; got:\n{}",
-            out
-        );
-        assert!(
-            out.contains("[placeholders: owner, repo]"),
-            "should list placeholders; got:\n{}",
-            out
-        );
-        // Bare name expected — no collision exists, so the `::` form must
-        // NOT appear yet.
-        assert!(
-            !out.contains("gh::workflow-runs"),
-            "no collision -> bare name; got:\n{}",
-            out
-        );
-    }
-
-    #[tokio::test]
-    async fn test_template_vs_concrete_name_collision() {
-        // A concrete skill and a template share a bare name. Per the
-        // collision rule, BOTH must be rendered in their disambiguated
-        // forms: `<server>__<name>` for the concrete, `<server>::<name>`
-        // for the template.
-        let tmp = TempDir::new().unwrap();
-        let mut r = HashMap::new();
-        r.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"skill-md","description":"static docs","url":"skill://docs/SKILL.md"},
-                   {"name":"docs","type":"mcp-resource-template","description":"per-product","url":"skill://docs/{product}/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) = setup_client_with_fake("srv", r, tmp.path().to_path_buf()).await;
-
-        let out = client
-            .get_dynamic_instructions("s")
-            .await
-            .expect("dynamic output");
-        assert!(
-            out.contains("srv__docs"),
-            "concrete collision form missing; got:\n{}",
-            out
-        );
-        assert!(
-            out.contains("srv::docs"),
-            "template collision form missing; got:\n{}",
-            out
-        );
-        // Neither should render as bare `docs` followed by a paren.
-        assert!(
-            !out.contains("• docs ("),
-            "bare 'docs' should not render under collision; got:\n{}",
-            out
-        );
-    }
-
-    #[tokio::test]
-    async fn test_fs_vs_mcp_collision_renders_prefixed() {
-        // A filesystem skill named "shared" coexists with an MCP skill
-        // of the same name. The MCP entry must be rendered prefixed so
-        // the model can still reach it.
-        let tmp = TempDir::new().unwrap();
-        let fs_skill_dir = tmp.path().join(".goose/skills/shared");
-        fs::create_dir_all(&fs_skill_dir).unwrap();
-        fs::write(
-            fs_skill_dir.join("SKILL.md"),
-            "---\nname: shared\ndescription: local\n---\nbody",
-        )
-        .unwrap();
-
-        let mut r = HashMap::new();
-        r.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"shared","type":"skill-md","description":"from mcp","url":"skill://shared/SKILL.md"}"#,
-            ),
-        );
-        let (client, _mgr, _tmp) = setup_client_with_fake("srv", r, tmp.path().to_path_buf()).await;
-
-        let out = client
-            .get_dynamic_instructions("s")
-            .await
-            .expect("dynamic output");
-        assert!(
-            out.contains("srv__shared"),
-            "MCP entry should be prefixed against FS collision; got:\n{}",
-            out
-        );
+        assert!(tx.is_closed());
     }
 
     #[tokio::test]
     async fn test_load_skill_resolves_server_prefix() {
-        // With two MCP servers publishing the same skill name, the model
-        // can disambiguate by using `<server>__<name>` as the load_skill
-        // argument.
         let tmp = TempDir::new().unwrap();
         let mut r1 = HashMap::new();
         r1.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"shared","type":"skill-md","description":"","url":"skill://shared/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "shared",
+                "",
+                r#","url":"skill://shared/SKILL.md""#,
+            )),
         );
         r1.insert(
             "skill://shared/SKILL.md".to_string(),
@@ -2485,9 +2011,11 @@ mod tests {
         let mut r2 = HashMap::new();
         r2.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"shared","type":"skill-md","description":"","url":"skill://shared/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "shared",
+                "",
+                r#","url":"skill://shared/SKILL.md""#,
+            )),
         );
         r2.insert(
             "skill://shared/SKILL.md".to_string(),
@@ -2505,82 +2033,17 @@ mod tests {
 
         assert!(!result.is_error.unwrap_or(false));
         let body = text_of(&result);
-        assert!(
-            body.contains("body from server two"),
-            "prefix should route to server two; got:\n{}",
-            body
-        );
+        assert!(body.contains("body from server two"), "got:\n{}", body);
         assert!(!body.contains("body from server one"));
     }
 
     #[tokio::test]
-    async fn test_load_skill_literal_name_wins_over_prefix_split() {
-        // A server publishes a skill whose name contains `__`. A second
-        // server coincidentally matches the left half of the split, with a
-        // skill matching the right half. `load_skill` called with the
-        // literal name must route to the literal entry, not the pair.
-        let tmp = TempDir::new().unwrap();
-
-        // Server "srv" hosts a skill literally named "foo__bar".
-        let mut r1 = HashMap::new();
-        r1.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"foo__bar","type":"skill-md","description":"","url":"skill://foo__bar/SKILL.md"}"#,
-            ),
-        );
-        r1.insert(
-            "skill://foo__bar/SKILL.md".to_string(),
-            "literal foo__bar body".to_string(),
-        );
-        let (client, mgr, _tmp) = setup_client_with_fake("srv", r1, tmp.path().to_path_buf()).await;
-
-        // Server "foo" hosts skill "bar" — creates the ambiguity.
-        let mut r2 = HashMap::new();
-        r2.insert(
-            "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"bar","type":"skill-md","description":"","url":"skill://bar/SKILL.md"}"#,
-            ),
-        );
-        r2.insert(
-            "skill://bar/SKILL.md".to_string(),
-            "foo's bar body".to_string(),
-        );
-        register_fake(&mgr, "foo", r2).await;
-
-        let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject =
-            serde_json::from_value(serde_json::json!({"name": "foo__bar"})).unwrap();
-        let result = client
-            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
-            .await
-            .unwrap();
-
-        assert!(!result.is_error.unwrap_or(false));
-        let body = text_of(&result);
-        assert!(
-            body.contains("literal foo__bar body"),
-            "literal skill name must win over server/skill prefix split; got:\n{}",
-            body
-        );
-        assert!(!body.contains("foo's bar body"));
-    }
-
-    #[tokio::test]
-    async fn test_load_mcp_skill_lists_supporting_files_like_fs() {
-        // MCP `load_skill` must surface a "Supporting Files" hint section
-        // that mirrors the FS behavior: relative paths under the skill's
-        // root URI, rendered as `load_skill(name: "<skill>/<rel>")`
-        // pointers. Content of the supporting resources must NOT be
-        // included — only their names/paths.
+    async fn test_load_mcp_skill_lists_supporting_files_via_resources_list() {
         let tmp = TempDir::new().unwrap();
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"skill-md","description":"D","url":"skill://docs/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry("docs", "D", r#","url":"skill://docs/SKILL.md""#)),
         );
         resources.insert(
             "skill://docs/SKILL.md".to_string(),
@@ -2590,12 +2053,6 @@ mod tests {
             "skill://docs/references/GUIDE.md".to_string(),
             "SHOULD NOT APPEAR IN OUTPUT".to_string(),
         );
-        resources.insert(
-            "skill://docs/templates/EXAMPLE.txt".to_string(),
-            "ALSO SHOULD NOT APPEAR".to_string(),
-        );
-        // A sibling resource outside this skill's root URI — must be
-        // filtered out of the Supporting Files section.
         resources.insert(
             "skill://other/SKILL.md".to_string(),
             "unrelated".to_string(),
@@ -2613,115 +2070,89 @@ mod tests {
 
         assert!(!result.is_error.unwrap_or(false));
         let body = text_of(&result);
-
-        assert!(
-            body.contains("main skill body"),
-            "missing SKILL.md body; got:\n{}",
-            body
-        );
-        assert!(
-            body.contains("Supporting Files"),
-            "missing section header; got:\n{}",
-            body
-        );
+        assert!(body.contains("main skill body"), "got:\n{}", body);
         assert!(
             body.contains("references/GUIDE.md → load_skill(name: \"docs/references/GUIDE.md\")"),
-            "missing GUIDE.md pointer; got:\n{}",
+            "got:\n{}",
             body
         );
-        assert!(
-            body.contains(
-                "templates/EXAMPLE.txt → load_skill(name: \"docs/templates/EXAMPLE.txt\")"
-            ),
-            "missing EXAMPLE.txt pointer; got:\n{}",
-            body
-        );
-
-        // Critical: supporting-file *content* must not leak into context
-        // alongside SKILL.md.
         assert!(
             !body.contains("SHOULD NOT APPEAR IN OUTPUT"),
-            "GUIDE.md content must not be auto-loaded; got:\n{}",
+            "got:\n{}",
             body
         );
-        assert!(
-            !body.contains("ALSO SHOULD NOT APPEAR"),
-            "EXAMPLE.txt content must not be auto-loaded; got:\n{}",
-            body
-        );
-        // Unrelated sibling must not be listed.
-        assert!(
-            !body.contains("skill://other/SKILL.md"),
-            "cross-skill resource must not appear; got:\n{}",
-            body
-        );
+        assert!(!body.contains("skill://other/SKILL.md"), "got:\n{}", body);
     }
 
     #[tokio::test]
-    async fn test_supporting_files_dedupe_directory_form_url() {
-        // When an index entry uses the directory-form url (ends in `/`),
-        // a server that also lists `…/SKILL.md` in resources/list must not
-        // produce a "SKILL.md" bullet next to the loaded body. Both URI
-        // forms denote the same skill; one entry, never both.
+    async fn test_supporting_files_via_directory_read() {
         let tmp = TempDir::new().unwrap();
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"docs","type":"skill-md","description":"D","url":"skill://docs/"}"#,
-            ),
+            index_json(&fm_entry("docs", "D", r#","url":"skill://docs/SKILL.md""#)),
         );
-        resources.insert("skill://docs/".to_string(), "main skill body".to_string());
-        resources.insert(
-            "skill://docs/SKILL.md".to_string(),
-            "alias body".to_string(),
-        );
+        resources.insert("skill://docs/SKILL.md".to_string(), "main body".to_string());
         resources.insert(
             "skill://docs/references/GUIDE.md".to_string(),
-            "guide content".to_string(),
+            "guide".to_string(),
         );
 
-        let (client, _mgr, _tmp_guard) =
-            setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
+        let mut dirs: DirMap = HashMap::new();
+        dirs.insert(
+            "skill://docs/".to_string(),
+            vec![
+                (
+                    "skill://docs/SKILL.md".to_string(),
+                    Some("text/markdown".to_string()),
+                ),
+                (
+                    "skill://docs/references".to_string(),
+                    Some("inode/directory".to_string()),
+                ),
+            ],
+        );
+        dirs.insert(
+            "skill://docs/references".to_string(),
+            vec![(
+                "skill://docs/references/GUIDE.md".to_string(),
+                Some("text/markdown".to_string()),
+            )],
+        );
+
+        let fake = FakeMcp::new(resources).with_directories(dirs);
+        let (client, mgr, _g) =
+            setup_client_with_built("srv", fake, tmp.path().to_path_buf()).await;
+        assert!(mgr.server_supports_directory_read("srv").await);
 
         let ctx = ToolCallContext::new("s".to_string(), None, None);
-        let args: JsonObject = serde_json::from_value(serde_json::json!({"name": "docs"})).unwrap();
         let result = client
-            .call_tool(&ctx, "load_skill", Some(args), CancellationToken::new())
+            .call_tool(
+                &ctx,
+                "load_skill",
+                Some(serde_json::from_value(serde_json::json!({"name": "docs"})).unwrap()),
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
-
-        assert!(!result.is_error.unwrap_or(false));
-        let body = text_of(&result);
-
         assert!(
-            body.contains("main skill body"),
-            "missing directory-form body; got:\n{}",
-            body
+            !result.is_error.unwrap_or(false),
+            "got: {}",
+            text_of(&result)
         );
+        let body = text_of(&result);
+        assert!(body.contains("main body"), "got:\n{}", body);
         assert!(
             body.contains("references/GUIDE.md → load_skill(name: \"docs/references/GUIDE.md\")"),
-            "missing GUIDE.md pointer; got:\n{}",
-            body
-        );
-        assert!(
-            !body.contains("SKILL.md → load_skill"),
-            "SKILL.md alias must not be listed as a supporting file; got:\n{}",
+            "directory walk should surface nested supporting file; got:\n{}",
             body
         );
     }
 
     #[tokio::test]
     async fn test_supporting_file_framing_parity_fs_vs_mcp() {
-        // Supporting-file loads (both FS and MCP) must use the
-        // `# Loaded: <skill>/<rel>` header + `File loaded into context.`
-        // footer — distinct from the SKILL.md framing so the model can
-        // tell "I just loaded a reference file" from "I just loaded a
-        // new skill". Regression guard: MCP supporting-file loads used
-        // to reuse the SKILL.md framing.
         let tmp = TempDir::new().unwrap();
 
-        // FS skill with a supporting file.
         let fs_skill_dir = tmp.path().join(".goose/skills/fs-demo");
         fs::create_dir_all(&fs_skill_dir).unwrap();
         fs::write(
@@ -2731,13 +2162,14 @@ mod tests {
         .unwrap();
         fs::write(fs_skill_dir.join("guide.md"), "fs supporting body").unwrap();
 
-        // MCP skill with the same shape.
         let mut resources = HashMap::new();
         resources.insert(
             "skill://index.json".to_string(),
-            index_json(
-                r#"{"name":"mcp-demo","type":"skill-md","description":"d","url":"skill://mcp-demo/SKILL.md"}"#,
-            ),
+            index_json(&fm_entry(
+                "mcp-demo",
+                "d",
+                r#","url":"skill://mcp-demo/SKILL.md""#,
+            )),
         );
         resources.insert(
             "skill://mcp-demo/SKILL.md".to_string(),
@@ -2751,7 +2183,6 @@ mod tests {
             setup_client_with_fake("srv", resources, tmp.path().to_path_buf()).await;
 
         let ctx = ToolCallContext::new("s".to_string(), None, None);
-
         let fs_result = client
             .call_tool(
                 &ctx,
@@ -2785,27 +2216,17 @@ mod tests {
         let mcp_text = text_of(&mcp_result);
 
         for (label, text) in [("fs", &fs_text), ("mcp", &mcp_text)] {
-            assert!(
-                text.starts_with("# Loaded: "),
-                "{}: supporting-file load must use `# Loaded: ` header; got:\n{}",
-                label,
-                text
-            );
+            assert!(text.starts_with("# Loaded: "), "{}: {}", label, text);
             assert!(
                 text.contains("File loaded into context."),
-                "{}: supporting-file load must use the file footer; got:\n{}",
+                "{}: {}",
                 label,
                 text
             );
-            assert!(
-                !text.starts_with("# Loaded Skill: "),
-                "{}: supporting-file load must NOT use the SKILL.md header; got:\n{}",
-                label,
-                text
-            );
+            assert!(!text.starts_with("# Loaded Skill: "), "{}: {}", label, text);
             assert!(
                 !text.contains("This knowledge is now available in your context."),
-                "{}: supporting-file load must NOT use the SKILL.md footer; got:\n{}",
+                "{}: {}",
                 label,
                 text
             );

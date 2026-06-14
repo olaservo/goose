@@ -2,17 +2,18 @@
 //!
 //! Bridges skills served over MCP (via `skill://` or any index-listed URI)
 //! into Goose's existing skills pipeline. This module is the discovery layer:
-//! it reads a server's `skill://index.json`, parses concrete skill entries,
-//! and returns [`McpSkillEntry`] values that the skills platform extension
-//! caches and surfaces in the system prompt.
+//! it reads a server's `skill://index.json`, parses skill entries, and returns
+//! [`McpSkillEntry`] values that the skills platform extension caches and
+//! surfaces in the system prompt.
 //!
 //! Scheme-agnostic: the SEP permits servers to list skills under a
 //! domain-native URI scheme (e.g. `github://owner/repo/.../SKILL.md`) so long
-//! as the entry appears in `skill://index.json` with `type: "skill-md"`.
+//! as the entry appears in `skill://index.json`.
 //!
 //! Security: per the SEP, skill content from MCP servers is UNTRUSTED model
-//! input. This module extracts only `name`, `description`, and URI locators
-//! from the index — never execution-capable fields.
+//! input. This module extracts only the skill's frontmatter and URI/digest
+//! locators from the index — never execution-capable fields. Loaded SKILL.md
+//! and archive content is verified against the index `digest` before use.
 
 use rmcp::model::{InitializeResult, ResourceContents};
 use serde::Deserialize;
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::agents::mcp_client::McpClientTrait;
+use crate::skills::SkillFrontmatter;
 
 /// Extension identifier per the SEP.
 pub(crate) const SKILLS_EXTENSION_ID: &str = "io.modelcontextprotocol/skills";
@@ -29,15 +31,6 @@ pub(crate) const SKILLS_EXTENSION_ID: &str = "io.modelcontextprotocol/skills";
 /// `skill://index.json` regardless of which scheme the listed skills use.
 pub(crate) const INDEX_URI: &str = "skill://index.json";
 
-/// The Agent Skills discovery schema URI this host has been tested
-/// against. Per the SEP ("Clients SHOULD match against known $schema
-/// URIs before processing"), we log at `debug!` when the server's
-/// declared `$schema` doesn't match — but still attempt to process the
-/// index leniently. Newer schemas typically remain wire-compatible for
-/// the small subset of fields we read.
-pub(crate) const KNOWN_INDEX_SCHEMA: &str =
-    "https://schemas.agentskills.io/discovery/0.2.0/schema.json";
-
 /// How long to wait for a server's index fetch before giving up.
 /// Applied at extension-registration time so a misbehaving server cannot
 /// stall session startup indefinitely. An empty cache on timeout is
@@ -45,101 +38,76 @@ pub(crate) const KNOWN_INDEX_SCHEMA: &str =
 /// explicit UI refresh repopulates.
 pub(crate) const INDEX_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// One archive distribution form of a skill, per `skills[].archives[]`.
+/// The archive unpacks into the skill's virtual file tree (`SKILL.md` at
+/// the root). `digest` is verified before the bytes are unpacked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveRef {
+    pub url: String,
+    pub media_type: String,
+    pub digest: String,
+}
+
 /// A single indexed skill served over MCP, as surfaced to the skills
-/// platform extension. `url` is stored as-is from the index (any scheme).
-/// The skill root (used for composing relative refs) is derived from `url`
-/// at use time via [`McpSkillEntry::skill_root_uri`] rather than cached as
-/// a separate field — per the SEP, hosts resolve relative refs against
-/// the skill's directory URI, which is the entry URI minus its final
-/// path segment.
+/// platform extension.
+///
+/// `name`/`description` are taken from the entry's verbatim `frontmatter`
+/// block (per SEP, the index carries the full `SKILL.md` frontmatter).
+///
+/// An entry exposes its `SKILL.md` as an individually-addressable resource
+/// (`url` + `digest`), as one or more `archives`, or both. `url` is `None`
+/// for archive-only entries; the skill root for relative refs is then the
+/// unpacked archive tree rather than a URI prefix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpSkillEntry {
     pub server: String,
     pub name: String,
     pub description: String,
-    pub url: String,
+    /// Resource URI of the skill's `SKILL.md` (any scheme). `None` when the
+    /// skill is distributed only as an archive.
+    pub url: Option<String>,
+    /// `sha256:<hex>` digest of the `SKILL.md` resource at `url`. Present
+    /// whenever `url` is; the host MUST verify the loaded body against it.
+    pub digest: Option<String>,
+    /// Archive forms of the skill. Non-empty for archive-distributed skills.
+    pub archives: Vec<ArchiveRef>,
 }
 
 impl McpSkillEntry {
-    /// Skill root URI: `url` truncated at (and including) the final `/`.
-    /// If `url` already ends with `/`, returns it unchanged. This matches
-    /// the SEP's relative-resolution rule — the entry URI's directory is
-    /// the base for relative refs, regardless of whether the trailing
-    /// segment is the literal `SKILL.md` or something else.
-    ///
-    /// Returns a borrowed slice — called on the per-turn prompt-render
-    /// path, so avoid the allocation.
-    pub fn skill_root_uri(&self) -> &str {
-        match self.url.rfind('/') {
-            Some(idx) => &self.url[..=idx],
-            None => &self.url,
+    /// Skill root URI for individually-addressed skills: `url` truncated at
+    /// (and including) the final `/`. Returns `None` for archive-only
+    /// entries (which have no URI namespace). Matches the SEP's
+    /// relative-resolution rule — the entry URI's directory is the base for
+    /// relative refs, regardless of whether the trailing segment is the
+    /// literal `SKILL.md` or a directory.
+    pub fn skill_root_uri(&self) -> Option<&str> {
+        let url = self.url.as_deref()?;
+        // `idx` is the byte offset of an ASCII `/`, always a valid UTF-8 boundary.
+        #[allow(clippy::string_slice)]
+        match url.rfind('/') {
+            Some(idx) => Some(&url[..=idx]),
+            None => Some(url),
         }
+    }
+
+    /// Returns the first archive whose `mediaType` this host can unpack, if
+    /// any. Used to load archive-distributed skills.
+    pub fn supported_archive(&self) -> Option<&ArchiveRef> {
+        self.archives
+            .iter()
+            .find(|a| crate::skills::archive::supports_media_type(&a.media_type))
     }
 }
 
-/// A templated skill catalog entry — `type: "mcp-resource-template"` in
-/// the SEP. `url_template` is an RFC 6570 level-1 template (e.g.
-/// `github://{owner}/{repo}/.../SKILL.md`); placeholders are resolved at
-/// `load_skill_template` time via the MCP `completion/complete` endpoint.
-///
-/// Stored separately from [`McpSkillEntry`] because templates need
-/// completion plumbing concrete entries don't, and the rendering path
-/// for the system prompt is distinct (a sibling bullet list).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct McpSkillTemplate {
-    pub server: String,
-    pub name: String,
-    pub description: String,
-    pub url_template: String,
-}
-
-impl McpSkillTemplate {
-    /// Returns the placeholder names (`{name}`) appearing in
-    /// `url_template`, in left-to-right order, de-duplicated. Used to
-    /// build the `[placeholders: ...]` hint in the system prompt and to
-    /// drive completion validation. Hand-rolled scanner; no regex
-    /// dependency added.
-    pub fn placeholders(&self) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let bytes = self.url_template.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'{' {
-                let start = i + 1;
-                let mut j = start;
-                while j < bytes.len() && bytes[j] != b'}' && bytes[j] != b'/' {
-                    j += 1;
-                }
-                if j < bytes.len() && bytes[j] == b'}' && j > start {
-                    if let Ok(name) = std::str::from_utf8(&bytes[start..j]) {
-                        if !out.iter().any(|n| n == name) {
-                            out.push(name.to_string());
-                        }
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-            i += 1;
-        }
-        out
-    }
-}
-
-/// All MCP-served skills discovered from a single server's index. The
-/// split mirrors the two SEP entry types — concrete `skill-md` entries
-/// addressable by name, and `mcp-resource-template` catalogs that the
-/// model addresses via `load_skill_template` after the host validates
-/// placeholder values against the server's completion endpoint.
+/// All MCP-served skills discovered from a single server's index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerSkills {
     pub concrete: Vec<McpSkillEntry>,
-    pub templates: Vec<McpSkillTemplate>,
 }
 
 impl ServerSkills {
     pub fn is_empty(&self) -> bool {
-        self.concrete.is_empty() && self.templates.is_empty()
+        self.concrete.is_empty()
     }
 }
 
@@ -153,30 +121,81 @@ pub fn server_declares_skills_capability(info: &InitializeResult) -> bool {
         .is_some_and(|m| m.contains_key(SKILLS_EXTENSION_ID))
 }
 
-/// Minimal index shape matching the SEP / agentskills.io discovery schema.
-/// Lenient: unknown fields are ignored; unknown `type` values cause the
-/// entry to be skipped (handled by the caller). `$schema` is captured
-/// so [`fetch_server_skills`] can log when it diverges from the schema
-/// the host was built against — per the SEP, clients SHOULD match
-/// against known `$schema` URIs before processing.
+/// Returns true if the server declares the skills extension with
+/// `directoryRead: true`. Per the SEP, clients MUST NOT call
+/// `resources/directory/read` against a server that has not declared it.
+pub fn server_declares_directory_read(info: &InitializeResult) -> bool {
+    info.capabilities
+        .extensions
+        .as_ref()
+        .and_then(|m| m.get(SKILLS_EXTENSION_ID))
+        .and_then(|cfg| cfg.get("directoryRead"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Index shape per the SEP. The index carries no `$schema`/version marker —
+/// it is versioned by the extension capability. Unknown fields are ignored.
 #[derive(Debug, Deserialize)]
 struct IndexDoc {
-    #[serde(default, rename = "$schema")]
-    schema: Option<String>,
     #[serde(default)]
     skills: Vec<IndexEntry>,
 }
 
+/// One `skills[]` entry. `frontmatter` is the verbatim `SKILL.md` YAML as
+/// JSON (required, carries `name`/`description`). Every entry MUST carry a
+/// `url` (+ `digest`), a non-empty `archives`, or both.
 #[derive(Debug, Deserialize)]
 struct IndexEntry {
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default, rename = "type")]
-    entry_type: Option<String>,
-    #[serde(default)]
-    description: Option<String>,
+    frontmatter: Option<serde_json::Value>,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    archives: Vec<IndexArchive>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IndexArchive {
+    url: String,
+    #[serde(rename = "mimeType")]
+    media_type: String,
+    digest: String,
+}
+
+/// Verify `bytes` against a `sha256:<hex>` digest from the index. Per the
+/// SEP, hosts MUST verify retrieved content against the index digest and
+/// MUST NOT use content that fails to match.
+pub fn verify_digest(expected: &str, bytes: &[u8]) -> Result<(), String> {
+    let Some(hex_expected) = expected.strip_prefix("sha256:") else {
+        return Err(format!(
+            "unsupported digest format '{}': expected 'sha256:<hex>'",
+            expected
+        ));
+    };
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let actual = to_hex(hasher.finalize());
+    if actual.eq_ignore_ascii_case(hex_expected.trim()) {
+        Ok(())
+    } else {
+        Err(format!(
+            "digest mismatch: index advertised {} but content hashes to sha256:{}",
+            expected, actual
+        ))
+    }
+}
+
+fn to_hex(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 /// Fetches and parses `skill://index.json` from a single MCP server via
@@ -229,107 +248,73 @@ pub async fn fetch_server_skills(
         }
     };
 
-    // SEP SHOULD: match against known $schema URIs before processing.
-    // Lenient — we still process. A server publishing a newer schema
-    // typically stays wire-compatible for our subset (name, type,
-    // description, url), and a server omitting `$schema` is common
-    // enough to not be worth blocking on.
-    match doc.schema.as_deref() {
-        Some(KNOWN_INDEX_SCHEMA) => {}
-        Some(other) => debug!(
-            server,
-            declared = other,
-            expected = KNOWN_INDEX_SCHEMA,
-            "skill index `$schema` does not match the host-known URI; processing leniently"
-        ),
-        None => debug!(
-            server,
-            "skill index has no `$schema` field; processing leniently"
-        ),
-    }
-
     let mut out = ServerSkills::default();
-    let mut template_counter = 0usize;
     for raw in doc.skills {
-        match parse_index_entry(server, raw, &mut template_counter) {
-            Parsed::Concrete(entry) => out.concrete.push(entry),
-            Parsed::Template(tpl) => out.templates.push(tpl),
-            Parsed::Skip => {}
+        if let Some(entry) = parse_entry(server, raw) {
+            out.concrete.push(entry);
         }
     }
     out
 }
 
-enum Parsed {
-    Concrete(McpSkillEntry),
-    Template(McpSkillTemplate),
-    Skip,
-}
-
-fn parse_index_entry(server: &str, raw: IndexEntry, template_counter: &mut usize) -> Parsed {
-    match raw.entry_type.as_deref() {
-        Some("skill-md") => parse_concrete(server, raw),
-        Some("mcp-resource-template") => parse_template(server, raw, template_counter),
-        Some(other) => {
-            debug!(
-                server,
-                entry_type = other,
-                "skipping unknown index entry type"
-            );
-            Parsed::Skip
-        }
-        None => {
-            debug!(server, "skipping index entry with no type");
-            Parsed::Skip
-        }
-    }
-}
-
-fn parse_concrete(server: &str, raw: IndexEntry) -> Parsed {
-    let Some(name) = raw.name.filter(|s| !s.is_empty()) else {
-        warn!(server, "skill-md index entry missing required `name`");
-        return Parsed::Skip;
+fn parse_entry(server: &str, raw: IndexEntry) -> Option<McpSkillEntry> {
+    // `name`/`description` come from the verbatim frontmatter block.
+    let Some(frontmatter) = raw.frontmatter else {
+        warn!(server, "skipping index entry with no `frontmatter`");
+        return None;
     };
-    let description = raw.description.unwrap_or_default();
-    let Some(url) = raw.url.filter(|s| !s.is_empty()) else {
-        warn!(server, name, "skill-md index entry missing required `url`");
-        return Parsed::Skip;
+    let fm: SkillFrontmatter = match serde_json::from_value(frontmatter) {
+        Ok(fm) => fm,
+        Err(e) => {
+            warn!(server, error = %e, "skipping index entry with unparseable `frontmatter`");
+            return None;
+        }
     };
-
-    if !url.ends_with("SKILL.md") {
-        debug!(
+    let Some(name) = fm.name.filter(|s| !s.is_empty()) else {
+        warn!(
             server,
-            name, url, "skill-md index entry `url` does not end in `SKILL.md`"
+            "skipping index entry whose frontmatter has no `name`"
         );
+        return None;
+    };
+
+    let url = raw.url.filter(|s| !s.is_empty());
+    let archives: Vec<ArchiveRef> = raw
+        .archives
+        .into_iter()
+        .filter(|a| !a.url.is_empty())
+        .map(|a| ArchiveRef {
+            url: a.url,
+            media_type: a.media_type,
+            digest: a.digest,
+        })
+        .collect();
+
+    // SEP MUST: every entry carries a `url`, a non-empty `archives`, or both.
+    if url.is_none() && archives.is_empty() {
+        warn!(
+            server,
+            name, "skipping index entry with neither `url` nor `archives`"
+        );
+        return None;
     }
 
-    Parsed::Concrete(McpSkillEntry {
+    if let Some(u) = &url {
+        if raw.digest.is_none() {
+            debug!(server, name, url = %u, "skill entry has `url` but no `digest`; content will be loaded unverified");
+        }
+        if !u.ends_with("SKILL.md") && !u.ends_with('/') {
+            debug!(server, name, url = %u, "skill entry `url` does not end in `SKILL.md` or `/`");
+        }
+    }
+
+    Some(McpSkillEntry {
         server: server.to_string(),
         name,
-        description,
+        description: fm.description,
         url,
-    })
-}
-
-fn parse_template(server: &str, raw: IndexEntry, counter: &mut usize) -> Parsed {
-    let Some(url_template) = raw.url.filter(|s| !s.is_empty()) else {
-        warn!(server, "mcp-resource-template entry missing required `url`");
-        return Parsed::Skip;
-    };
-    // Per the SEP, the SHOULD-level template entry name is optional —
-    // synthesize a stable ordinal when absent so the model has a handle
-    // to address it.
-    let name = raw.name.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        *counter += 1;
-        format!("template-{}", counter)
-    });
-    let description = raw.description.unwrap_or_default();
-
-    Parsed::Template(McpSkillTemplate {
-        server: server.to_string(),
-        name,
-        description,
-        url_template,
+        digest: raw.digest,
+        archives,
     })
 }
 
@@ -440,11 +425,17 @@ mod tests {
         }
     }
 
-    fn index_with(entries: &str) -> String {
+    /// Build an index entry with a `frontmatter` block from `name`/`description`
+    /// plus the supplied extra JSON fields (e.g. `,"url":"…","digest":"…"`).
+    fn entry(name: &str, description: &str, extra: &str) -> String {
         format!(
-            r#"{{"$schema":"https://schemas.agentskills.io/discovery/0.2.0/schema.json","skills":[{}]}}"#,
-            entries
+            r#"{{"frontmatter":{{"name":"{}","description":"{}"}}{}}}"#,
+            name, description, extra
         )
+    }
+
+    fn index_with(entries: &str) -> String {
+        format!(r#"{{"skills":[{}]}}"#, entries)
     }
 
     #[test]
@@ -456,15 +447,61 @@ mod tests {
         assert!(!server_declares_skills_capability(&undeclared));
     }
 
+    #[test]
+    fn test_server_declares_directory_read() {
+        let mut caps = ExtensionCapabilities::new();
+        let mut cfg = JsonObject::new();
+        cfg.insert("directoryRead".to_string(), serde_json::json!(true));
+        caps.insert(SKILLS_EXTENSION_ID.to_string(), cfg);
+        let info = InitializeResult::new(
+            ServerCapabilities::builder()
+                .enable_resources()
+                .enable_extensions_with(caps)
+                .build(),
+        );
+        assert!(server_declares_directory_read(&info));
+
+        // Declared extension but no directoryRead flag → false.
+        assert!(!server_declares_directory_read(
+            &FakeSkillsServer::with_capability()
+        ));
+        // No extension at all → false.
+        assert!(!server_declares_directory_read(
+            &FakeSkillsServer::without_capability()
+        ));
+    }
+
+    #[test]
+    fn test_verify_digest_match_and_mismatch() {
+        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        let bytes = b"hello";
+        assert!(verify_digest(
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+            bytes
+        )
+        .is_ok());
+        assert!(verify_digest("sha256:deadbeef", bytes).is_err());
+        assert!(verify_digest("md5:whatever", bytes).is_err());
+    }
+
     #[tokio::test]
     async fn test_discover_via_index_json() {
         let mut resources = HashMap::new();
         resources.insert(
             INDEX_URI.to_string(),
-            index_with(
-                r#"{"name":"git-workflow","type":"skill-md","description":"Git conventions","url":"skill://git-workflow/SKILL.md"},
-                   {"name":"refunds","type":"skill-md","description":"Process refunds","url":"skill://acme/billing/refunds/SKILL.md"}"#,
-            ),
+            index_with(&format!(
+                "{},{}",
+                entry(
+                    "git-workflow",
+                    "Git conventions",
+                    r#","url":"skill://git-workflow/SKILL.md","digest":"sha256:abc""#
+                ),
+                entry(
+                    "refunds",
+                    "Process refunds",
+                    r#","url":"skill://acme/billing/refunds/SKILL.md","digest":"sha256:def""#
+                ),
+            )),
         );
         let server = FakeSkillsServer {
             info: FakeSkillsServer::with_capability(),
@@ -483,12 +520,109 @@ mod tests {
         let entries = &skills.concrete;
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "git-workflow");
-        assert_eq!(entries[0].url, "skill://git-workflow/SKILL.md");
-        assert_eq!(entries[0].skill_root_uri(), "skill://git-workflow/");
+        assert_eq!(
+            entries[0].url.as_deref(),
+            Some("skill://git-workflow/SKILL.md")
+        );
+        assert_eq!(entries[0].digest.as_deref(), Some("sha256:abc"));
+        assert_eq!(entries[0].skill_root_uri(), Some("skill://git-workflow/"));
         assert_eq!(entries[0].server, "gh");
         assert_eq!(entries[1].name, "refunds");
-        assert_eq!(entries[1].skill_root_uri(), "skill://acme/billing/refunds/");
-        assert!(skills.templates.is_empty());
+        assert_eq!(
+            entries[1].skill_root_uri(),
+            Some("skill://acme/billing/refunds/")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_archive_only_entry() {
+        // An entry with no `url`, only an archive. It must surface (name +
+        // description from frontmatter) with the archive recorded.
+        let mut resources = HashMap::new();
+        resources.insert(
+            INDEX_URI.to_string(),
+            index_with(&entry(
+                "pdf-processing",
+                "Process PDFs",
+                r#","archives":[{"url":"skill://pdf-processing.tar.gz","mimeType":"application/gzip","digest":"sha256:aaa"}]"#,
+            )),
+        );
+        let server = FakeSkillsServer {
+            info: FakeSkillsServer::with_capability(),
+            resources,
+            delay: None,
+        };
+
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.concrete.len(), 1);
+        let e = &skills.concrete[0];
+        assert_eq!(e.name, "pdf-processing");
+        assert!(e.url.is_none());
+        assert_eq!(e.skill_root_uri(), None);
+        assert_eq!(e.archives.len(), 1);
+        assert_eq!(e.archives[0].media_type, "application/gzip");
+        assert!(e.supported_archive().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_discover_skips_entry_without_url_or_archives() {
+        let mut resources = HashMap::new();
+        resources.insert(
+            INDEX_URI.to_string(),
+            index_with(&format!(
+                "{},{}",
+                entry(
+                    "ok",
+                    "fine",
+                    r#","url":"skill://ok/SKILL.md","digest":"sha256:1""#
+                ),
+                entry("bad", "no locator", ""),
+            )),
+        );
+        let server = FakeSkillsServer {
+            info: FakeSkillsServer::with_capability(),
+            resources,
+            delay: None,
+        };
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.concrete.len(), 1);
+        assert_eq!(skills.concrete[0].name, "ok");
+    }
+
+    #[tokio::test]
+    async fn test_discover_skips_entry_without_frontmatter_name() {
+        let mut resources = HashMap::new();
+        resources.insert(
+            INDEX_URI.to_string(),
+            index_with(
+                r#"{"frontmatter":{"description":"nameless"},"url":"skill://x/SKILL.md","digest":"sha256:1"}"#,
+            ),
+        );
+        let server = FakeSkillsServer {
+            info: FakeSkillsServer::with_capability(),
+            resources,
+            delay: None,
+        };
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(skills.is_empty());
     }
 
     #[tokio::test]
@@ -510,51 +644,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_returns_templates() {
-        let mut resources = HashMap::new();
-        resources.insert(
-            INDEX_URI.to_string(),
-            index_with(
-                r#"{"name":"real","type":"skill-md","description":"","url":"skill://real/SKILL.md"},
-                   {"name":"product-docs","type":"mcp-resource-template","description":"Per-product docs","url":"skill://docs/{product}/SKILL.md"},
-                   {"type":"mcp-resource-template","description":"Workflow runs","url":"github://{owner}/{repo}/.../SKILL.md"}"#,
-            ),
-        );
-        let server = FakeSkillsServer {
-            info: FakeSkillsServer::with_capability(),
-            resources,
-            delay: None,
-        };
-
-        let skills = fetch_server_skills(
-            "gh",
-            &server as &dyn McpClientTrait,
-            "s",
-            CancellationToken::new(),
-        )
-        .await;
-
-        // Concrete bin: one entry.
-        assert_eq!(skills.concrete.len(), 1);
-        assert_eq!(skills.concrete[0].name, "real");
-
-        // Template bin: two entries. First keeps its declared name; second
-        // is unnamed, gets a synthesized `template-N` handle.
-        assert_eq!(skills.templates.len(), 2);
-        assert_eq!(skills.templates[0].name, "product-docs");
-        assert_eq!(skills.templates[0].placeholders(), vec!["product"]);
-        assert_eq!(skills.templates[1].name, "template-1");
-        assert_eq!(skills.templates[1].placeholders(), vec!["owner", "repo"]);
-    }
-
-    #[tokio::test]
     async fn test_discover_accepts_non_skill_scheme() {
         let mut resources = HashMap::new();
         resources.insert(
             INDEX_URI.to_string(),
-            index_with(
-                r#"{"name":"pull-requests","type":"skill-md","description":"","url":"github://github/repo/skills/pull-requests/SKILL.md"}"#,
-            ),
+            index_with(&entry(
+                "pull-requests",
+                "PRs",
+                r#","url":"github://github/repo/skills/pull-requests/SKILL.md","digest":"sha256:1""#,
+            )),
         );
         let server = FakeSkillsServer {
             info: FakeSkillsServer::with_capability(),
@@ -572,92 +670,25 @@ mod tests {
         let entries = &skills.concrete;
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[0].url,
-            "github://github/repo/skills/pull-requests/SKILL.md"
+            entries[0].url.as_deref(),
+            Some("github://github/repo/skills/pull-requests/SKILL.md")
         );
         assert_eq!(
             entries[0].skill_root_uri(),
-            "github://github/repo/skills/pull-requests/"
+            Some("github://github/repo/skills/pull-requests/")
         );
-    }
-
-    #[tokio::test]
-    async fn test_discover_tolerates_unknown_schema_uri() {
-        // SEP says clients SHOULD match against known $schema URIs before
-        // processing; our policy is to log at debug! and still process,
-        // since the subset of fields we read (name, type, description,
-        // url) is stable across the schema revisions we know about.
-        let mut resources = HashMap::new();
-        resources.insert(
-            INDEX_URI.to_string(),
-            // Hand-rolled to override the `$schema` value (the `index_with`
-            // helper hardcodes the canonical one).
-            r#"{
-              "$schema": "https://schemas.agentskills.io/discovery/9.9.9/schema.json",
-              "skills": [
-                {"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"}
-              ]
-            }"#
-            .to_string(),
-        );
-        let server = FakeSkillsServer {
-            info: FakeSkillsServer::with_capability(),
-            resources,
-            delay: None,
-        };
-
-        let skills = fetch_server_skills(
-            "gh",
-            &server as &dyn McpClientTrait,
-            "s",
-            CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(skills.concrete.len(), 1);
-        assert_eq!(skills.concrete[0].name, "alpha");
-    }
-
-    #[tokio::test]
-    async fn test_discover_tolerates_missing_schema_field() {
-        // Same lenient posture for an index with no `$schema` at all —
-        // common in early servers — should not block discovery.
-        let mut resources = HashMap::new();
-        resources.insert(
-            INDEX_URI.to_string(),
-            r#"{
-              "skills": [
-                {"name":"alpha","type":"skill-md","description":"a","url":"skill://alpha/SKILL.md"}
-              ]
-            }"#
-            .to_string(),
-        );
-        let server = FakeSkillsServer {
-            info: FakeSkillsServer::with_capability(),
-            resources,
-            delay: None,
-        };
-        let skills = fetch_server_skills(
-            "gh",
-            &server as &dyn McpClientTrait,
-            "s",
-            CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(skills.concrete.len(), 1);
     }
 
     #[tokio::test]
     async fn test_discover_directory_form_url() {
-        // Per the SEP, hosts MUST tolerate `url` entries that do not end in
-        // the literal `SKILL.md` — e.g. servers that publish a skill's
-        // directory URI. The skill_root_uri derivation should yield the
-        // same directory.
         let mut resources = HashMap::new();
         resources.insert(
             INDEX_URI.to_string(),
-            index_with(
-                r#"{"name":"refunds","type":"skill-md","description":"","url":"skill://acme/billing/refunds/"}"#,
-            ),
+            index_with(&entry(
+                "refunds",
+                "",
+                r#","url":"skill://acme/billing/refunds/","digest":"sha256:1""#,
+            )),
         );
         let server = FakeSkillsServer {
             info: FakeSkillsServer::with_capability(),
@@ -674,13 +705,18 @@ mod tests {
         .await;
         let entries = &skills.concrete;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].url, "skill://acme/billing/refunds/");
-        assert_eq!(entries[0].skill_root_uri(), "skill://acme/billing/refunds/");
+        assert_eq!(
+            entries[0].url.as_deref(),
+            Some("skill://acme/billing/refunds/")
+        );
+        assert_eq!(
+            entries[0].skill_root_uri(),
+            Some("skill://acme/billing/refunds/")
+        );
     }
 
     #[tokio::test]
     async fn test_discover_timeout_does_not_block() {
-        // Server that sleeps longer than the fetch timeout.
         let server = FakeSkillsServer {
             info: FakeSkillsServer::with_capability(),
             resources: HashMap::new(),
@@ -698,7 +734,6 @@ mod tests {
         let elapsed = start.elapsed();
 
         assert!(skills.is_empty());
-        // Should have bailed after the timeout, not waited for the server.
         assert!(
             elapsed < INDEX_FETCH_TIMEOUT + Duration::from_millis(500),
             "fetch took {:?}, should have timed out",

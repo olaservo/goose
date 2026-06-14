@@ -5,7 +5,12 @@ import { Card } from '../ui/card';
 import { Button } from '../ui/button';
 import { Skeleton } from '../ui/skeleton';
 import { MainPanelLayout } from '../Layout/MainPanelLayout';
-import { getSlashCommands } from '../../api';
+import {
+  getSlashCommands,
+  getMcpSkillServers,
+  setExtensionSkillsEnabled,
+  type McpSkillServerSummary,
+} from '../../api';
 import { errorMessage } from '../../utils/conversionUtils';
 import { getInitialWorkingDir } from '../../utils/workingDir';
 import { defineMessages, useIntl } from '../../i18n';
@@ -57,6 +62,15 @@ const i18n = defineMessages({
   comingSoon: {
     id: 'skillsView.comingSoon',
     defaultMessage: 'Coming soon',
+  },
+  nudgeText: {
+    id: 'skillsView.nudgeText',
+    defaultMessage:
+      'The {server} server offers {count, plural, one {# skill} other {# skills}} — not yet enabled.',
+  },
+  nudgeEnable: {
+    id: 'skillsView.nudgeEnable',
+    defaultMessage: 'Enable',
   },
 });
 
@@ -111,6 +125,7 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
   const [error, setError] = useState<string | null>(null);
   const [showContent, setShowContent] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const [pendingServers, setPendingServers] = useState<McpSkillServerSummary[]>([]);
 
   const filteredSkills = useMemo(() => {
     if (!searchTerm) return skills;
@@ -140,12 +155,40 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
           origin: cmd.origin ?? undefined,
         }));
       setSkills(skillEntries);
+
+      if (sessionId) {
+        const servers = await getMcpSkillServers({
+          query: { session_id: sessionId },
+          throwOnError: true,
+        });
+        setPendingServers(
+          (servers.data ?? []).filter(
+            (s) => !s.skillsEnabled && s.concreteCount + s.templateCount > 0
+          )
+        );
+      } else {
+        setPendingServers([]);
+      }
     } catch (err) {
       setError(errorMessage(err, 'Failed to load skills'));
     } finally {
       setLoading(false);
     }
   }, [sessionId]);
+
+  const enableServerSkills = useCallback(
+    async (server: string) => {
+      // Optimistically drop the nudge, then reload so the newly injected
+      // skills appear in the list.
+      setPendingServers((prev) => prev.filter((s) => s.server !== server));
+      await setExtensionSkillsEnabled({
+        body: { name: server, skills_enabled: true, session_id: sessionId },
+        throwOnError: true,
+      });
+      await loadSkills();
+    },
+    [sessionId, loadSkills]
+  );
 
   useEffect(() => {
     loadSkills();
@@ -241,6 +284,35 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
             </p>
           </div>
         </div>
+
+        {pendingServers.length > 0 && (
+          <div className="px-8 pb-4 space-y-2">
+            {pendingServers.map((server) => (
+              <Card
+                key={server.server}
+                className="py-2 px-4 flex justify-between items-center gap-4 border border-borderSubtle bg-background-secondary"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Zap className="w-4 h-4 shrink-0 text-text-secondary" />
+                  <p className="text-sm truncate">
+                    {intl.formatMessage(i18n.nudgeText, {
+                      server: server.server,
+                      count: server.concreteCount + server.templateCount,
+                    })}
+                  </p>
+                </div>
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => enableServerSkills(server.server)}
+                >
+                  {intl.formatMessage(i18n.nudgeEnable)}
+                </Button>
+              </Card>
+            ))}
+          </div>
+        )}
 
         <div className="flex-1 min-h-0 relative px-8">
           <ScrollArea className="h-full">

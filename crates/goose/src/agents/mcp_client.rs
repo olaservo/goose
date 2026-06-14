@@ -109,25 +109,19 @@ pub trait McpClientTrait: Send + Sync {
         Err(Error::TransportClosed)
     }
 
-    /// Validate or complete a resource-template argument against the
-    /// server's `completion/complete` endpoint (SEP MCP-1319). Used by
-    /// the skills platform extension when instantiating
-    /// `mcp-resource-template` skill catalogs — if the server supports
-    /// completion, the host can check that user-supplied placeholder
-    /// values are in the server's known set before resolving the URI.
-    ///
-    /// Default impl returns `TransportClosed` so test stubs and clients
-    /// that don't implement completion don't need to override; callers
-    /// MUST treat this as "completion unsupported" rather than a hard
-    /// failure (per the SEP, completion is SHOULD, not MUST).
-    async fn complete_resource_argument(
+    /// List the direct children of a directory-like resource via the skills
+    /// extension's `resources/directory/read` method. Returns the same shape
+    /// as `resources/list` (a page of `Resource` metadata plus an optional
+    /// `nextCursor`). Per the SEP, only call against a server that declared
+    /// `directoryRead: true`. Default impl returns `TransportClosed` so test
+    /// stubs and clients without the method don't need to override.
+    async fn directory_read(
         &self,
         _session_id: &str,
-        _uri_template: &str,
-        _argument_name: &str,
-        _current_value: &str,
+        _uri: &str,
+        _cursor: Option<String>,
         _cancel_token: CancellationToken,
-    ) -> Result<rmcp::model::CompletionInfo, Error> {
+    ) -> Result<ListResourcesResult, Error> {
         Err(Error::TransportClosed)
     }
 
@@ -661,35 +655,37 @@ impl McpClientTrait for McpClient {
         }
     }
 
-    async fn complete_resource_argument(
+    async fn directory_read(
         &self,
         session_id: &str,
-        uri_template: &str,
-        argument_name: &str,
-        current_value: &str,
+        uri: &str,
+        cursor: Option<String>,
         cancel_token: CancellationToken,
-    ) -> Result<rmcp::model::CompletionInfo, Error> {
-        use rmcp::model::{ArgumentInfo, CompleteRequestParams, Reference};
+    ) -> Result<ListResourcesResult, Error> {
+        use rmcp::model::CustomRequest;
 
-        let params = CompleteRequestParams::new(
-            Reference::for_resource(uri_template),
-            ArgumentInfo {
-                name: argument_name.to_string(),
-                value: current_value.to_string(),
-            },
-        );
+        let mut params = serde_json::Map::new();
+        params.insert("uri".to_string(), Value::String(uri.to_string()));
+        if let Some(cursor) = cursor {
+            params.insert("cursor".to_string(), Value::String(cursor));
+        }
 
         let res = self
             .send_request_with_context(
                 session_id,
                 None,
-                ClientRequest::CompleteRequest(Request::new(params)),
+                ClientRequest::CustomRequest(CustomRequest::new(
+                    "resources/directory/read",
+                    Some(Value::Object(params)),
+                )),
                 cancel_token,
             )
             .await?;
 
         match res {
-            ServerResult::CompleteResult(result) => Ok(result.completion),
+            ServerResult::CustomResult(value) => {
+                serde_json::from_value(value.0).map_err(|_| ServiceError::UnexpectedResponse)
+            }
             _ => Err(ServiceError::UnexpectedResponse),
         }
     }
@@ -881,6 +877,11 @@ fn inject_session_context_into_request(
             req.extensions =
                 inject_session_context_into_extensions(req.extensions, session_id, working_dir);
             ClientRequest::GetPromptRequest(req)
+        }
+        ClientRequest::CustomRequest(mut req) => {
+            req.extensions =
+                inject_session_context_into_extensions(req.extensions, session_id, working_dir);
+            ClientRequest::CustomRequest(req)
         }
         other => other,
     }

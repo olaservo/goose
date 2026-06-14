@@ -97,7 +97,11 @@ fn migrate_platform_extensions(config: &mut Mapping) -> bool {
                 }
             };
 
-            let new_entry = ExtensionEntry { config, enabled };
+            let new_entry = ExtensionEntry {
+                config,
+                enabled,
+                skills_enabled: false,
+            };
 
             if let Ok(value) = serde_yaml::to_value(&new_entry) {
                 extensions_map.insert(ext_key, value);
@@ -287,6 +291,7 @@ mod tests {
                 available_tools: Vec::new(),
             },
             enabled: false,
+            skills_enabled: false,
         };
         extensions.insert(
             serde_yaml::Value::String("todo".to_string()),
