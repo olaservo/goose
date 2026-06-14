@@ -178,7 +178,7 @@ pub fn verify_digest(expected: &str, bytes: &[u8]) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    let actual = to_hex(hasher.finalize());
+    let actual = crate::utils::bytes_to_hex(hasher.finalize());
     if actual.eq_ignore_ascii_case(hex_expected.trim()) {
         Ok(())
     } else {
@@ -187,15 +187,6 @@ pub fn verify_digest(expected: &str, bytes: &[u8]) -> Result<(), String> {
             expected, actual
         ))
     }
-}
-
-fn to_hex(bytes: impl AsRef<[u8]>) -> String {
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{:02x}", b));
-    }
-    out
 }
 
 /// Fetches and parses `skill://index.json` from a single MCP server via

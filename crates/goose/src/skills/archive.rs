@@ -69,15 +69,25 @@ fn safe_relative_path(raw: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
-fn account(total: &mut u64, len: u64) -> Result<(), String> {
-    *total = total.saturating_add(len);
-    if *total > MAX_UNPACKED_BYTES {
+/// Read an archive entry fully into memory while enforcing the cumulative
+/// unpack budget. The read is bounded to one byte past the remaining budget,
+/// so a single oversized entry is rejected *before* it is wholly buffered —
+/// the cumulative-only check would otherwise OOM on a one-entry bomb.
+fn read_within_budget(reader: impl Read, total: &mut u64, what: &str) -> Result<Vec<u8>, String> {
+    let remaining = MAX_UNPACKED_BYTES.saturating_sub(*total);
+    let mut buf = Vec::new();
+    let read = reader
+        .take(remaining + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("failed to read {}: {}", what, e))? as u64;
+    if read > remaining {
         return Err(format!(
             "archive unpacks to more than the {}MiB limit",
             MAX_UNPACKED_BYTES / (1024 * 1024)
         ));
     }
-    Ok(())
+    *total += read;
+    Ok(buf)
 }
 
 fn unpack_tar_gz(bytes: &[u8]) -> Result<SkillTree, String> {
@@ -91,6 +101,7 @@ fn unpack_tar_gz(bytes: &[u8]) -> Result<SkillTree, String> {
 
     let mut tree = SkillTree::new();
     let mut total: u64 = 0;
+    let mut count: usize = 0;
     for entry in entries {
         let mut entry = entry.map_err(|e| format!("corrupt tar entry: {}", e))?;
         let entry_type = entry.header().entry_type();
@@ -109,14 +120,13 @@ fn unpack_tar_gz(bytes: &[u8]) -> Result<SkillTree, String> {
             .into_owned();
         let rel = safe_relative_path(&path)?;
 
-        if tree.len() >= MAX_ENTRIES {
+        // Count processed file entries, not surviving tree keys: duplicate
+        // paths overwrite in the tree, so `tree.len()` would undercount.
+        count += 1;
+        if count > MAX_ENTRIES {
             return Err(format!("archive has more than {} entries", MAX_ENTRIES));
         }
-        let mut buf = Vec::new();
-        let read = entry
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("failed to read tar entry '{}': {}", rel, e))?;
-        account(&mut total, read as u64)?;
+        let buf = read_within_budget(&mut entry, &mut total, &format!("tar entry '{}'", rel))?;
         tree.insert(rel, buf);
     }
     Ok(tree)
@@ -150,11 +160,7 @@ fn unpack_zip(bytes: &[u8]) -> Result<SkillTree, String> {
             continue;
         }
         let rel = safe_relative_path(&name.to_string_lossy())?;
-        let mut buf = Vec::new();
-        let read = file
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("failed to read zip entry '{}': {}", rel, e))?;
-        account(&mut total, read as u64)?;
+        let buf = read_within_budget(&mut file, &mut total, &format!("zip entry '{}'", rel))?;
         tree.insert(rel, buf);
     }
     Ok(tree)
@@ -229,6 +235,32 @@ mod tests {
         assert!(!supports_media_type("application/x-7z-compressed"));
         assert!(supports_media_type("application/gzip"));
         assert!(supports_media_type("application/zip"));
+    }
+
+    #[test]
+    fn test_rejects_single_oversized_entry() {
+        // One entry larger than the cap must be rejected without first
+        // buffering the whole thing — the decompression-bomb guard.
+        let big = vec![0u8; (MAX_UNPACKED_BYTES + 1) as usize];
+        let bytes = make_tar_gz(&[("SKILL.md", &big)]);
+        let err = unpack_skill_archive(&bytes, "application/gzip").unwrap_err();
+        assert!(err.contains("limit"), "unexpected error: {}", err);
+
+        let bytes = make_zip(&[("SKILL.md", &big)]);
+        let err = unpack_skill_archive(&bytes, "application/zip").unwrap_err();
+        assert!(err.contains("limit"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn test_tar_entry_count_counts_duplicates() {
+        // Duplicate paths must count against MAX_ENTRIES even though they
+        // collapse to one tree key.
+        let dupes: Vec<(&str, &[u8])> = (0..=MAX_ENTRIES)
+            .map(|_| ("SKILL.md", b"x" as &[u8]))
+            .collect();
+        let bytes = make_tar_gz(&dupes);
+        let err = unpack_skill_archive(&bytes, "application/gzip").unwrap_err();
+        assert!(err.contains("more than"), "unexpected error: {}", err);
     }
 
     #[test]
