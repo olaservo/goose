@@ -842,7 +842,7 @@ async fn populate_mcp_skills_cache(
 /// without a session id the host cannot dispatch `resources/read` for
 /// `skill://index.json`, so there's nothing for the watcher to do. A
 /// later call carrying a real session id will then spawn correctly.
-fn spawn_skill_list_changed_watcher(
+async fn spawn_skill_list_changed_watcher(
     server_name: String,
     client: McpClientBox,
     cache: std::sync::Arc<tokio::sync::RwLock<crate::skills::mcp_client::ServerSkills>>,
@@ -859,8 +859,10 @@ fn spawn_skill_list_changed_watcher(
     if watcher_spawned.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+    // Subscribe before spawning so a `list_changed` arriving between
+    // registration and the task starting isn't dropped on the floor.
+    let mut rx = client.subscribe().await;
     tokio::spawn(async move {
-        let mut rx = client.subscribe().await;
         loop {
             // Select on cancellation so `remove_extension` can end the
             // task. Without this, the task holds an Arc clone of the
@@ -1036,7 +1038,8 @@ impl ExtensionManager {
                     watcher_spawned,
                     cancel,
                     session_id,
-                );
+                )
+                .await;
             }
             return Ok(());
         }
@@ -1281,7 +1284,8 @@ impl ExtensionManager {
             watcher_spawned.clone(),
             cancel.clone(),
             session_id,
-        );
+        )
+        .await;
 
         let mut extensions = self.extensions.lock().await;
         extensions.insert(
@@ -1330,7 +1334,8 @@ impl ExtensionManager {
             watcher_spawned.clone(),
             cancel.clone(),
             session_id,
-        );
+        )
+        .await;
 
         self.extensions.lock().await.insert(
             normalized,

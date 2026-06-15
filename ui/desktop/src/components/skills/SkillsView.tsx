@@ -253,7 +253,7 @@ export default function SkillsView({ sessionId }: SkillsViewProps = {}) {
     return (
       <div className="space-y-2">
         {filteredSkills.map((skill) => (
-          <SkillItem key={skill.name} skill={skill} />
+          <SkillItem key={skill.origin ? `${skill.origin}:${skill.name}` : skill.name} skill={skill} />
         ))}
       </div>
     );

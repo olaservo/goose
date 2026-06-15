@@ -5,7 +5,7 @@ use crate::session_context::{SESSION_ID_HEADER, WORKING_DIR_HEADER};
 use rmcp::model::{
     CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, ErrorCode,
     ExtensionCapabilities, Extensions, JsonObject, ListRootsResult, LoggingMessageNotification,
-    Meta, Root, SamplingMessageContent,
+    Meta, ResourceListChangedNotification, Root, SamplingMessageContent,
 };
 /// MCP client implementation for Goose
 use rmcp::{
@@ -305,6 +305,23 @@ impl ClientHandler for GooseClient {
                 notification.extensions = context.extensions.clone();
                 let _ =
                     handler.try_send(ServerNotification::LoggingMessageNotification(notification));
+            });
+    }
+
+    async fn on_resource_list_changed(
+        &self,
+        context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) {
+        self.notification_handlers
+            .lock()
+            .await
+            .iter()
+            .for_each(|handler| {
+                let mut notification = ResourceListChangedNotification::default();
+                notification.extensions = context.extensions.clone();
+                let _ = handler.try_send(ServerNotification::ResourceListChangedNotification(
+                    notification,
+                ));
             });
     }
 

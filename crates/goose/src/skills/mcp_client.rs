@@ -157,11 +157,16 @@ struct IndexEntry {
     archives: Vec<IndexArchive>,
 }
 
+// Fields default so one malformed archive entry (missing `mimeType`/`digest`)
+// is skipped in `parse_entry` rather than failing the whole index parse and
+// dropping every skill the server advertises.
 #[derive(Debug, Deserialize)]
 struct IndexArchive {
+    #[serde(default)]
     url: String,
-    #[serde(rename = "mimeType")]
+    #[serde(default, rename = "mimeType")]
     media_type: String,
+    #[serde(default)]
     digest: String,
 }
 
@@ -273,11 +278,21 @@ fn parse_entry(server: &str, raw: IndexEntry) -> Option<McpSkillEntry> {
     let archives: Vec<ArchiveRef> = raw
         .archives
         .into_iter()
-        .filter(|a| !a.url.is_empty())
-        .map(|a| ArchiveRef {
-            url: a.url,
-            media_type: a.media_type,
-            digest: a.digest,
+        .filter_map(|a| {
+            if a.url.is_empty() || a.media_type.is_empty() || a.digest.is_empty() {
+                warn!(
+                    server,
+                    name,
+                    url = %a.url,
+                    "skipping malformed archive entry (missing url, mimeType, or digest)"
+                );
+                return None;
+            }
+            Some(ArchiveRef {
+                url: a.url,
+                media_type: a.media_type,
+                digest: a.digest,
+            })
         })
         .collect();
 
@@ -559,6 +574,48 @@ mod tests {
         assert_eq!(e.archives.len(), 1);
         assert_eq!(e.archives[0].media_type, "application/gzip");
         assert!(e.supported_archive().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_discover_skips_malformed_archive_keeps_index() {
+        // A malformed archive (missing `digest`) must be skipped without
+        // failing the whole index parse and dropping every other skill.
+        let mut resources = HashMap::new();
+        resources.insert(
+            INDEX_URI.to_string(),
+            index_with(&format!(
+                "{},{}",
+                entry(
+                    "with-bad-archive",
+                    "has url plus a broken archive",
+                    r#","url":"skill://with-bad-archive/SKILL.md","digest":"sha256:1","archives":[{"url":"skill://x.tar.gz","mimeType":"application/gzip"}]"#,
+                ),
+                entry("clean", "fine", r#","url":"skill://clean/SKILL.md","digest":"sha256:2""#),
+            )),
+        );
+        let server = FakeSkillsServer {
+            info: FakeSkillsServer::with_capability(),
+            resources,
+            delay: None,
+        };
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.concrete.len(), 2);
+        let bad = skills
+            .concrete
+            .iter()
+            .find(|e| e.name == "with-bad-archive")
+            .unwrap();
+        assert!(
+            bad.archives.is_empty(),
+            "malformed archive should be dropped"
+        );
+        assert!(skills.concrete.iter().any(|e| e.name == "clean"));
     }
 
     #[tokio::test]

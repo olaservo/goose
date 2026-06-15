@@ -156,6 +156,18 @@ fn unpack_zip(bytes: &[u8]) -> Result<SkillTree, String> {
                 file.name()
             ));
         };
+        // Reject symlinks, mirroring the tar path: a symlink entry's bytes
+        // are a link target that could resolve outside the skill dir if the
+        // tree is ever materialized to disk.
+        if file
+            .unix_mode()
+            .is_some_and(|mode| mode & 0o170000 == 0o120000)
+        {
+            return Err(format!(
+                "zip entry '{}' is a symlink",
+                name.to_string_lossy()
+            ));
+        }
         if file.is_dir() {
             continue;
         }
@@ -227,6 +239,20 @@ mod tests {
     fn test_zip_rejects_traversal() {
         let bytes = make_zip(&[("../escape.md", b"nope")]);
         assert!(unpack_skill_archive(&bytes, "application/zip").is_err());
+    }
+
+    #[test]
+    fn test_zip_rejects_symlink() {
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            zw.add_symlink("link", "/etc/passwd", SimpleFileOptions::default())
+                .unwrap();
+            zw.finish().unwrap();
+        }
+        let err = unpack_skill_archive(&buf, "application/zip").unwrap_err();
+        assert!(err.contains("symlink"), "unexpected error: {}", err);
     }
 
     #[test]
