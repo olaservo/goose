@@ -13,6 +13,7 @@ use rmcp::model::{
 };
 use rmcp::model::{
     ElicitationAction, ErrorCode, ExtensionCapabilities, Extensions, JsonObject, MetaObject,
+    ResourceListChangedNotification,
 };
 use rmcp::{
     model::{
@@ -126,6 +127,45 @@ pub trait McpClientTrait: Send + Sync {
         Err(Error::TransportClosed)
     }
 
+    /// List the direct children of a directory-like resource via the skills
+    /// extension's `resources/directory/read` method. Returns the same shape
+    /// as `resources/list` (a page of `Resource` metadata plus an optional
+    /// `nextCursor`). Per the SEP, only call against a server that declared
+    /// `directoryRead: true`. Default impl returns `TransportClosed` so test
+    /// stubs and clients without the method don't need to override.
+    async fn directory_read(
+        &self,
+        _session_id: &str,
+        _uri: &str,
+        _cursor: Option<String>,
+        _cancel_token: CancellationToken,
+    ) -> Result<ListResourcesResult, Error> {
+        Err(Error::TransportClosed)
+    }
+
+    /// Enumerate the server's skills via the skills extension's `skills/list`
+    /// method. Per the SEP, only call against a server that declared the
+    /// `io.modelcontextprotocol/skills` extension.
+    async fn skills_list(
+        &self,
+        _session_id: &str,
+        _cursor: Option<String>,
+        _cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsListResult, Error> {
+        Err(Error::TransportClosed)
+    }
+
+    /// Retrieve a single skill entry by its SKILL.md URI via `skills/get`.
+    /// Same capability gate as `skills_list`.
+    async fn skills_get(
+        &self,
+        _session_id: &str,
+        _uri: &str,
+        _cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsGetResult, Error> {
+        Err(Error::TransportClosed)
+    }
+
     async fn list_prompts(
         &self,
         _session_id: &str,
@@ -150,6 +190,15 @@ pub trait McpClientTrait: Send + Sync {
     }
 
     async fn get_moim(&self, _session_id: &str) -> Option<String> {
+        None
+    }
+
+    /// Optional per-turn dynamic addition to the extension's instructions.
+    /// Returned text is appended to the static `InitializeResult.instructions`
+    /// when `ExtensionManager::get_extensions_info` assembles the system
+    /// prompt. Called on every reply, so implementations MUST NOT do network
+    /// I/O inline — read from caches instead. Default: no dynamic contribution.
+    async fn get_dynamic_instructions(&self, _session_id: &str) -> Option<String> {
         None
     }
 
@@ -393,6 +442,20 @@ impl ClientHandler for GooseClient {
         self.handle_tool_list_changed().await;
     }
 
+    async fn on_resource_list_changed(
+        &self,
+        context: rmcp::service::NotificationContext<RoleClient>,
+    ) {
+        let notification = ResourceListChangedNotification {
+            extensions: context.extensions,
+            ..Default::default()
+        };
+        fan_out_notification(
+            &mut *self.notification_handlers.lock().await,
+            ServerNotification::ResourceListChangedNotification(notification),
+        );
+    }
+
     #[expect(deprecated)]
     async fn on_logging_message(
         &self,
@@ -559,7 +622,17 @@ impl ClientHandler for GooseClient {
     }
 
     fn get_info(&self) -> ClientInfo {
-        let extensions = self.resolved_extensions();
+        let mut extensions = self.resolved_extensions();
+
+        // Advertise host-side support for the skills-over-MCP SEP
+        // (`io.modelcontextprotocol/skills`). The SEP does not require
+        // clients to declare this; we do so informationally so servers
+        // can branch on "client understands skills" if they ever need
+        // to. Empty object per SEP §Capability Declaration.
+        extensions.insert(
+            crate::skills::mcp_client::SKILLS_EXTENSION_ID.to_string(),
+            JsonObject::new(),
+        );
 
         InitializeRequestParams::new(
             #[expect(deprecated)]
@@ -806,6 +879,108 @@ impl McpClientTrait for McpClient {
         }
     }
 
+    async fn directory_read(
+        &self,
+        session_id: &str,
+        uri: &str,
+        cursor: Option<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<ListResourcesResult, Error> {
+        use rmcp::model::CustomRequest;
+
+        let mut params = serde_json::Map::new();
+        params.insert("uri".to_string(), Value::String(uri.to_string()));
+        if let Some(cursor) = cursor {
+            params.insert("cursor".to_string(), Value::String(cursor));
+        }
+
+        let res = self
+            .send_request_with_context(
+                session_id,
+                None,
+                None,
+                ClientRequest::CustomRequest(CustomRequest::new(
+                    "resources/directory/read",
+                    Some(Value::Object(params)),
+                )),
+                cancel_token,
+            )
+            .await?;
+
+        match res {
+            ServerResult::CustomResult(value) => {
+                serde_json::from_value(value.0).map_err(|_| ServiceError::UnexpectedResponse)
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    async fn skills_list(
+        &self,
+        session_id: &str,
+        cursor: Option<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsListResult, Error> {
+        use rmcp::model::CustomRequest;
+
+        let mut params = serde_json::Map::new();
+        if let Some(cursor) = cursor {
+            params.insert("cursor".to_string(), Value::String(cursor));
+        }
+
+        let res = self
+            .send_request_with_context(
+                session_id,
+                None,
+                None,
+                ClientRequest::CustomRequest(CustomRequest::new(
+                    "skills/list",
+                    Some(Value::Object(params)),
+                )),
+                cancel_token,
+            )
+            .await?;
+
+        match res {
+            ServerResult::CustomResult(value) => {
+                serde_json::from_value(value.0).map_err(|_| ServiceError::UnexpectedResponse)
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
+    async fn skills_get(
+        &self,
+        session_id: &str,
+        uri: &str,
+        cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsGetResult, Error> {
+        use rmcp::model::CustomRequest;
+
+        let mut params = serde_json::Map::new();
+        params.insert("uri".to_string(), Value::String(uri.to_string()));
+
+        let res = self
+            .send_request_with_context(
+                session_id,
+                None,
+                None,
+                ClientRequest::CustomRequest(CustomRequest::new(
+                    "skills/get",
+                    Some(Value::Object(params)),
+                )),
+                cancel_token,
+            )
+            .await?;
+
+        match res {
+            ServerResult::CustomResult(value) => {
+                serde_json::from_value(value.0).map_err(|_| ServiceError::UnexpectedResponse)
+            }
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
+
     async fn list_tools(
         &self,
         session_id: &str,
@@ -1033,6 +1208,15 @@ fn inject_session_context_into_request(
                 None,
             );
             ClientRequest::GetPromptRequest(req)
+        }
+        ClientRequest::CustomRequest(mut req) => {
+            req.extensions = inject_session_context_into_extensions(
+                req.extensions,
+                session_id,
+                working_dir,
+                None,
+            );
+            ClientRequest::CustomRequest(req)
         }
         other => other,
     }
@@ -1550,6 +1734,26 @@ mod tests {
             !extensions.contains_key(MCP_APPS_UI_EXTENSION_ID),
             "explicit empty host extensions should disable platform fallback"
         );
+    }
+
+    #[test]
+    fn test_client_capabilities_advertise_skills_extension() {
+        // Both CLI and Desktop platforms should advertise the skills SEP
+        // extension — it's a host-level capability, not platform-specific.
+        for platform in [GoosePlatform::GooseCli, GoosePlatform::GooseDesktop] {
+            let client = new_client(platform.clone());
+            let info = ClientHandler::get_info(&client);
+            let extensions = info
+                .capabilities
+                .extensions
+                .as_ref()
+                .expect("client capabilities should include an extensions map");
+            assert!(
+                extensions.contains_key(crate::skills::mcp_client::SKILLS_EXTENSION_ID),
+                "client ({:?}) should advertise io.modelcontextprotocol/skills",
+                platform
+            );
+        }
     }
 
     #[test]
