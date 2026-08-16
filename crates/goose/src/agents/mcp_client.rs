@@ -1331,6 +1331,7 @@ mod tests {
                 tools_client.clone(),
                 None,
                 None,
+                None,
             )
             .await;
 

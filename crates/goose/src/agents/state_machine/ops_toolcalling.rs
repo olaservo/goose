@@ -644,7 +644,7 @@ impl Operation<Session, GooseEffect> for ToolExecutionOperation<'_> {
 
         let mut extensions = self
             .extension_manager
-            .get_extensions_info(&session.working_dir)
+            .get_extensions_info(&session.id, &session.working_dir)
             .await;
         extensions.retain(|extension| extension.name != crate::skills::EXTENSION_NAME);
         if extensions.is_empty() {

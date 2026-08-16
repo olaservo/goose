@@ -879,7 +879,14 @@ impl GooseAcpAgent {
 
         agent
             .extension_manager
-            .add_client("developer".into(), developer_config, client, info, None)
+            .add_client(
+                "developer".into(),
+                developer_config,
+                client,
+                info,
+                None,
+                None,
+            )
             .await;
     }
 

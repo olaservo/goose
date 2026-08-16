@@ -837,6 +837,7 @@ async fn build_test_pipeline(
                     calculator.clone(),
                     calculator.get_info().cloned(),
                     None,
+                    None,
                 )
                 .await;
         } else {

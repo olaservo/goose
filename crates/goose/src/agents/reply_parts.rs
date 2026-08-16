@@ -203,7 +203,7 @@ impl Agent {
         // Prepare system prompt
         let extensions_info = self
             .extension_manager
-            .get_extensions_info(working_dir)
+            .get_extensions_info(session_id, working_dir)
             .await;
         let model_config = self.model_config_for_session(session_id).await?;
 
