@@ -1134,6 +1134,7 @@ mod tests {
             // Set it as disabled initially so tests can enable it
             let todo_extension_entry = ExtensionEntry {
                 enabled: false,
+                skills_enabled: false,
                 config: ExtensionConfig::Platform {
                     name: "todo".to_string(),
                     description:

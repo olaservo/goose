@@ -15,6 +15,11 @@ const EXTENSIONS_CONFIG_KEY: &str = "extensions";
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ExtensionEntry {
     pub enabled: bool,
+    /// Opt-in consent to inject this server's MCP-served skills into the model's
+    /// context. Discovery is unconditional; injection is gated on this flag.
+    /// Absent in older config → false (skills discovered but not injected).
+    #[serde(default)]
+    pub skills_enabled: bool,
     #[serde(flatten)]
     pub config: ExtensionConfig,
 }
@@ -196,6 +201,30 @@ fn set_extension_enabled_with_config(config: &Config, key: &str, enabled: bool) 
     updated
 }
 
+/// Returns true when an existing extension was updated, false when the key was missing.
+pub fn set_extension_skills_enabled(key: &str, skills_enabled: bool) -> bool {
+    set_extension_skills_enabled_with_config(Config::global(), key, skills_enabled)
+}
+
+fn set_extension_skills_enabled_with_config(
+    config: &Config,
+    key: &str,
+    skills_enabled: bool,
+) -> bool {
+    let mut updated = false;
+    with_raw_extensions_mapping(config, |extensions| {
+        let Some(entry) = extensions.get_mut(key) else {
+            return ExtensionMutation::Noop;
+        };
+
+        entry.skills_enabled = skills_enabled;
+        updated = true;
+        ExtensionMutation::Upsert(key.to_string(), Box::new(entry.clone()))
+    });
+
+    updated
+}
+
 pub fn get_all_extensions() -> Vec<ExtensionEntry> {
     let extensions = get_extensions_map();
     extensions.into_values().collect()
@@ -209,6 +238,14 @@ pub fn get_all_extension_names() -> Vec<String> {
 pub fn is_extension_enabled(key: &str) -> bool {
     let extensions = get_extensions_map();
     extensions.get(key).map(|e| e.enabled).unwrap_or(false)
+}
+
+pub fn is_skills_enabled(key: &str) -> bool {
+    let extensions = get_extensions_map();
+    extensions
+        .get(key)
+        .map(|e| e.skills_enabled)
+        .unwrap_or(false)
 }
 
 /// Returns the configured enabled state for an extension, or `None` when it has no entry.
@@ -343,6 +380,7 @@ mod tests {
     fn builtin_entry(name: &str, enabled: bool) -> ExtensionEntry {
         ExtensionEntry {
             enabled,
+            skills_enabled: false,
             config: ExtensionConfig::Builtin {
                 name: name.to_string(),
                 description: format!("{name} description"),
@@ -497,6 +535,7 @@ extensions:
     fn test_get_extension_by_name_resolves_saved_entry_by_key() {
         let saved = ExtensionEntry {
             enabled: true,
+            skills_enabled: false,
             config: ExtensionConfig::Stdio {
                 name: "My Tool".to_string(),
                 description: "saved description".to_string(),
@@ -806,5 +845,35 @@ extensions:
         let (config, _config_file, _secrets_file) = test_config("");
 
         assert_eq!(configured_enabled_state(&config, "chatrecall"), Some(false));
+    }
+
+    #[test]
+    fn skills_enabled_defaults_to_false_when_absent() {
+        let yaml = r#"
+enabled: true
+type: builtin
+name: developer
+description: ""
+"#;
+        let entry: ExtensionEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(entry.enabled);
+        assert!(!entry.skills_enabled);
+    }
+
+    #[test]
+    fn skills_enabled_round_trips() {
+        let yaml = r#"
+enabled: true
+skills_enabled: true
+type: builtin
+name: developer
+description: ""
+"#;
+        let entry: ExtensionEntry = serde_yaml::from_str(yaml).unwrap();
+        assert!(entry.skills_enabled);
+
+        let reserialized = serde_yaml::to_string(&entry).unwrap();
+        let round_tripped: ExtensionEntry = serde_yaml::from_str(&reserialized).unwrap();
+        assert!(round_tripped.skills_enabled);
     }
 }
