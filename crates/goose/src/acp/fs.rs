@@ -2,7 +2,7 @@ use crate::acp::tool_call_notifier::ToolCallNotifier;
 use crate::acp::tools::AcpAwareToolMeta;
 use crate::agents::mcp_client::{Error as McpError, McpClientTrait};
 use crate::agents::platform_extensions::developer::edit::{
-    resolve_path, string_replace, FileEditParams, FileReadParams, FileWriteParams,
+    reject_uri_path, resolve_path, string_replace, FileEditParams, FileReadParams, FileWriteParams,
 };
 use crate::agents::platform_extensions::developer::shell::{ShellParams, OUTPUT_LIMIT_BYTES};
 use crate::agents::platform_extensions::developer::DeveloperClient;
@@ -146,6 +146,9 @@ impl AcpTools {
             Ok(p) => p,
             Err(e) => return Ok(error_result(e)),
         };
+        if let Some(err) = reject_uri_path(&params.path) {
+            return Ok(err);
+        }
         let path = resolve_path(&params.path, ctx.working_dir.as_deref());
         self.update_tool_call(
             ctx,
@@ -169,6 +172,9 @@ impl AcpTools {
             Ok(p) => p,
             Err(e) => return Ok(error_result(e)),
         };
+        if let Some(err) = reject_uri_path(&params.path) {
+            return Ok(err);
+        }
         let path = resolve_path(&params.path, ctx.working_dir.as_deref());
         self.update_tool_call(
             ctx,
@@ -205,6 +211,9 @@ impl AcpTools {
             Ok(p) => p,
             Err(e) => return Ok(error_result(e)),
         };
+        if let Some(err) = reject_uri_path(&params.path) {
+            return Ok(err);
+        }
         let path = resolve_path(&params.path, ctx.working_dir.as_deref());
         self.update_tool_call(
             ctx,
