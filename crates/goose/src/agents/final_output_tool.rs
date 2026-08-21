@@ -8,8 +8,18 @@ use serde_json::Value;
 use std::borrow::Cow;
 
 pub const FINAL_OUTPUT_TOOL_NAME: &str = "recipe__final_output";
+pub const FINAL_OUTPUT_SUCCESS_MESSAGE: &str = "Final output successfully collected.";
 pub const FINAL_OUTPUT_CONTINUATION_MESSAGE: &str =
     "You MUST call the `final_output` tool NOW with the final output for the user.";
+
+pub(crate) fn structured_output_unsupported_message(provider_name: &str) -> String {
+    format!(
+        "This recipe declares a structured `response`, but provider `{provider_name}` can't \
+         support it because it never receives goose's built-in `final_output` tool, so the \
+         model can never satisfy this recipe. Remove the entire `response` block from the recipe \
+         or run it with a different provider."
+    )
+}
 
 pub struct FinalOutputTool {
     pub response: Response,
@@ -131,7 +141,7 @@ impl FinalOutputTool {
                     Ok(parsed_value) => {
                         self.final_output = Some(Self::parsed_final_output_string(parsed_value));
                         ToolCallResult::from(Ok(rmcp::model::CallToolResult::success(vec![
-                            ContentBlock::text("Final output successfully collected.".to_string()),
+                            ContentBlock::text(FINAL_OUTPUT_SUCCESS_MESSAGE.to_string()),
                         ])))
                     }
                     Err(error) => ToolCallResult::from(Err(ErrorData {
