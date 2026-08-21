@@ -909,6 +909,10 @@ impl McpClientTrait for McpClient {
 
         match res {
             ServerResult::CustomResult(value) => {
+                let result_type = value.0.get("resultType").map(|v| v.as_str().unwrap_or(""));
+                if !crate::skills::mcp_client::is_complete_result(result_type) {
+                    return Err(ServiceError::UnexpectedResponse);
+                }
                 serde_json::from_value(value.0).map_err(|_| ServiceError::UnexpectedResponse)
             }
             _ => Err(ServiceError::UnexpectedResponse),

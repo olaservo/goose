@@ -336,10 +336,9 @@ fn find_mcp_by_name<'a>(mcp: &'a [McpSkillEntry], query: &str) -> Option<&'a Mcp
 }
 
 /// Enumerates supporting-file relative refs for an MCP skill (excluding the
-/// SKILL.md itself). When the entry carries `resources`, that complete
-/// enumeration is the source of truth (SEP §Resources) — no extra round
-/// trips. For dynamic skills without `resources`: when the owning server
-/// declares `directoryRead: true`, walks the skill tree via
+/// SKILL.md itself). The entry's manifest is the source of truth
+/// (SEP §Resources) — no extra round trips. For dynamic skills: when the
+/// owning server declares `directoryRead: true`, walks the skill tree via
 /// `resources/directory/read`; otherwise filters the server's flat
 /// `resources/list`. Best-effort in the dynamic case: any error yields an
 /// empty list and no section is rendered. Surfaces only pointers, never
@@ -353,7 +352,7 @@ async fn enumerate_mcp_supporting_resources(
     let root = entry.skill_root_uri();
     let root_prefix = format!("{}/", root);
 
-    let uris: Vec<String> = if let Some(resources) = &entry.resources {
+    let uris: Vec<String> = if let Some(resources) = entry.manifest() {
         resources.iter().map(|r| r.uri.clone()).collect()
     } else if mgr.server_supports_directory_read(&entry.server).await {
         directory_walk(mgr, session_id, &entry.server, root, cancel).await
@@ -1203,7 +1202,8 @@ mod tests {
             });
             match entry {
                 Some(doc) => Ok(SkillsGetResult {
-                    skill: serde_json::from_value(doc).map_err(|_| Error::UnexpectedResponse)?,
+                    result_type: None,
+                    skill: doc,
                 }),
                 None => Err(Error::TransportClosed),
             }
@@ -1270,7 +1270,7 @@ mod tests {
         let resources: Vec<serde_json::Value> = files
             .iter()
             .map(|(file_uri, body)| {
-                serde_json::json!({"uri": file_uri, "digest": sha256_digest(body.as_bytes())})
+                serde_json::json!({"uri": file_uri, "digest": sha256_digest(body.as_bytes()), "size": body.len()})
             })
             .collect();
         serde_json::json!({
@@ -1426,7 +1426,7 @@ mod tests {
         let doc = serde_json::json!({"skills": [{
             "uri": uri,
             "frontmatter": {"name": "sneaky", "description": "d"},
-            "resources": [{"uri": uri, "digest": sha256_digest(md.as_bytes())}],
+            "resources": [{"uri": uri, "digest": sha256_digest(md.as_bytes()), "size": md.len()}],
         }]});
         let resources = HashMap::from([(uri.to_string(), md.to_string())]);
         let (client, _mgr, _g) =
@@ -1487,10 +1487,13 @@ mod tests {
         register_built_fake(&mgr, "gh", fake2).await;
         let stale_entry = {
             let mut e = mgr.aggregated_mcp_skills().await.remove(0);
-            e.resources = Some(vec![crate::skills::mcp_client::SkillResourceRef {
-                uri: uri.clone(),
-                digest: sha256_digest(old_md.as_bytes()),
-            }]);
+            e.resources = crate::skills::mcp_client::SkillResources::Manifest(vec![
+                crate::skills::mcp_client::SkillResourceRef {
+                    uri: uri.clone(),
+                    digest: sha256_digest(old_md.as_bytes()),
+                    size: old_md.len() as u64,
+                },
+            ]);
             e
         };
         mgr.remember_skill_entry("gh", stale_entry).await;
@@ -1856,13 +1859,14 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_skill_supporting_files_via_directory_read() {
         let tmp = TempDir::new().unwrap();
-        // A dynamic skill (no `resources`) falls back to the directory walk
-        // for supporting-file enumeration.
+        // A dynamic skill falls back to the directory walk for
+        // supporting-file enumeration.
         let uri = "skill://docs/SKILL.md";
         let md = skill_md("docs", "D", "main body");
         let doc = serde_json::json!({"skills": [{
             "uri": uri,
             "frontmatter": {"name": "docs", "description": "D"},
+            "resources": "dynamic",
         }]});
         let resources = HashMap::from([
             (uri.to_string(), md),

@@ -40,12 +40,23 @@ pub(crate) const LIST_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// emitting endless cursors cannot spin the fetch forever.
 const MAX_LIST_PAGES: usize = 64;
 
-/// One `{uri, digest}` pair from a skill entry's `resources` enumeration.
+/// One `{uri, digest, size}` triple from a skill entry's `resources`
+/// enumeration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillResourceRef {
     pub uri: String,
     /// `sha256:<hex>` digest of the file at `uri`.
     pub digest: String,
+    /// Byte length of the raw content the digest covers.
+    pub size: u64,
+}
+
+/// A skill entry's `resources`: the complete file manifest, or the SEP's
+/// `"dynamic"` marker for skills whose content cannot be pre-digested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillResources {
+    Manifest(Vec<SkillResourceRef>),
+    Dynamic,
 }
 
 /// A single skill served over MCP, as surfaced to the skills platform
@@ -64,11 +75,9 @@ pub struct McpSkillEntry {
     /// Verbatim frontmatter from the entry, kept for the SEP-mandated
     /// field-by-field identity check against the fetched `SKILL.md`.
     pub frontmatter: serde_json::Value,
-    /// Complete `{uri, digest}` enumeration of the skill's files, including
-    /// `SKILL.md` itself. `None` when the server omitted `resources`
-    /// (dynamically generated skill): no integrity verification is possible
-    /// and reads within the skill are unrestricted by a listing.
-    pub resources: Option<Vec<SkillResourceRef>>,
+    /// The skill's file manifest (including `SKILL.md` itself), or
+    /// [`SkillResources::Dynamic`]: unverifiable, reads unrestricted.
+    pub resources: SkillResources,
 }
 
 impl McpSkillEntry {
@@ -85,22 +94,26 @@ impl McpSkillEntry {
         format!("{}/{}", self.skill_root_uri(), relative)
     }
 
-    /// The digest recorded for `uri` in this entry's `resources`, if the
-    /// entry carries one.
+    /// The manifest of this entry's files, or `None` for a dynamic skill.
+    pub fn manifest(&self) -> Option<&[SkillResourceRef]> {
+        match &self.resources {
+            SkillResources::Manifest(refs) => Some(refs),
+            SkillResources::Dynamic => None,
+        }
+    }
+
+    /// The digest recorded for `uri` in this entry's manifest, if any.
     pub fn digest_for(&self, uri: &str) -> Option<&str> {
-        self.resources
-            .as_ref()?
+        self.manifest()?
             .iter()
             .find(|r| r.uri == uri)
             .map(|r| r.digest.as_str())
     }
 
-    /// Pre-read gate, per SEP §Integrity and verification: while acting on
-    /// a skill for which the host holds an entry with `resources`, reads
-    /// within the skill MUST resolve only to listed URIs. Entries without
-    /// `resources` (dynamic skills) impose no restriction.
+    /// Pre-read gate: reads within a skill with a manifest resolve only to
+    /// listed URIs. Dynamic skills impose no restriction.
     pub fn verify_read_uri_listed(&self, uri: &str) -> Result<(), String> {
-        let Some(resources) = &self.resources else {
+        let Some(resources) = self.manifest() else {
             return Ok(());
         };
         if resources.iter().any(|r| r.uri == uri) {
@@ -114,18 +127,25 @@ impl McpSkillEntry {
         }
     }
 
-    /// Verify content fetched for `uri` against this entry, per SEP
-    /// §Integrity and verification:
-    /// - entry has `resources` and lists `uri` → digest must match;
-    /// - entry has `resources` and does NOT list `uri` → verification
-    ///   failure (an unlisted file is a change to the skill);
-    /// - entry has no `resources` (dynamic skill) → nothing to verify.
+    /// Verify content fetched for `uri` against this entry's manifest:
+    /// size and digest must match, and an unlisted `uri` is a verification
+    /// failure. Dynamic skills have nothing to verify.
     pub fn verify_read(&self, uri: &str, bytes: &[u8]) -> Result<(), String> {
-        let Some(resources) = &self.resources else {
+        let Some(resources) = self.manifest() else {
             return Ok(());
         };
         match resources.iter().find(|r| r.uri == uri) {
-            Some(r) => verify_digest(&r.digest, bytes),
+            Some(r) => {
+                if bytes.len() as u64 != r.size {
+                    return Err(format!(
+                        "size mismatch: entry advertised {} bytes for '{}' but read {} bytes",
+                        r.size,
+                        uri,
+                        bytes.len()
+                    ));
+                }
+                verify_digest(&r.digest, bytes)
+            }
             None => Err(format!(
                 "'{}' is not listed in the skill's resources; refusing unverifiable read \
                  (the skill may have changed — refresh via skills/get)",
@@ -189,12 +209,16 @@ pub fn server_declares_directory_read(info: &InitializeResult) -> bool {
         .unwrap_or(false)
 }
 
-/// `skills/list` result shape per the SEP. Unknown fields are ignored.
+/// `skills/list` result shape per the SEP. Entries stay as raw JSON so one
+/// malformed entry is skipped in `parse_entry` rather than failing the whole
+/// listing.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillsListResult {
     #[serde(default)]
-    pub skills: Vec<WireSkillEntry>,
+    pub result_type: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<serde_json::Value>,
     #[serde(default)]
     pub next_cursor: Option<String>,
     #[serde(default)]
@@ -206,20 +230,36 @@ pub struct SkillsListResult {
 /// `skills/get` result shape per the SEP: one entry under `skill`.
 #[derive(Debug, Deserialize)]
 pub struct SkillsGetResult {
-    pub skill: WireSkillEntry,
+    #[serde(default, rename = "resultType")]
+    pub result_type: Option<String>,
+    pub skill: serde_json::Value,
 }
 
-/// One wire-format skill entry. Fields default so one malformed entry is
-/// skipped in `parse_entry` rather than failing the whole listing parse and
-/// dropping every skill the server advertises.
+/// Absent `resultType` means `"complete"` (2026-07-28 base protocol). Any
+/// other value is one this client cannot interpret, and the result must be
+/// treated as invalid rather than parsed as if complete.
+pub(crate) fn is_complete_result(result_type: Option<&str>) -> bool {
+    matches!(result_type, None | Some("complete"))
+}
+
+/// One wire-format skill entry. `resources` has no default: an entry that
+/// omits it is invalid per SEP §Resources and is dropped.
 #[derive(Debug, Deserialize)]
 pub struct WireSkillEntry {
     #[serde(default)]
     pub uri: Option<String>,
     #[serde(default)]
     pub frontmatter: Option<serde_json::Value>,
-    #[serde(default)]
-    pub resources: Option<Vec<WireResourceRef>>,
+    pub resources: WireResources,
+}
+
+/// Manifest array or a bare string (`parse_entry` requires `"dynamic"`).
+/// Any other JSON type fails the entry's deserialization.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum WireResources {
+    Manifest(Vec<WireResourceRef>),
+    Marker(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +268,8 @@ pub struct WireResourceRef {
     pub uri: String,
     #[serde(default)]
     pub digest: String,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// Verify `bytes` against a `sha256:<hex>` digest from a skill entry. Per the
@@ -298,6 +340,14 @@ pub async fn fetch_server_skills(
             let result = client
                 .skills_list(session_id, cursor.take(), cancel.clone())
                 .await?;
+            if !is_complete_result(result.result_type.as_deref()) {
+                warn!(
+                    server,
+                    result_type = result.result_type.as_deref().unwrap_or_default(),
+                    "skills/list returned an unrecognized resultType; treating the listing as invalid"
+                );
+                return Err(crate::agents::mcp_client::Error::UnexpectedResponse);
+            }
             entries.extend(result.skills);
             ttl_ms = ttl_ms.or(result.ttl_ms);
             cache_scope = cache_scope.or(result.cache_scope);
@@ -366,11 +416,27 @@ pub async fn fetch_skill_entry(
         .await
         .map_err(|e| format!("skills/get failed for '{}': {}", uri, e))?;
 
+    if !is_complete_result(result.result_type.as_deref()) {
+        return Err(format!(
+            "skills/get for '{}' returned unrecognized resultType '{}'",
+            uri,
+            result.result_type.unwrap_or_default()
+        ));
+    }
+
     parse_entry(server, result.skill)
         .ok_or_else(|| format!("skills/get returned an unusable entry for '{}'", uri))
 }
 
-fn parse_entry(server: &str, raw: WireSkillEntry) -> Option<McpSkillEntry> {
+fn parse_entry(server: &str, raw: serde_json::Value) -> Option<McpSkillEntry> {
+    let raw: WireSkillEntry = match serde_json::from_value(raw) {
+        Ok(entry) => entry,
+        Err(e) => {
+            warn!(server, error = %e, "skipping invalid skill entry");
+            return None;
+        }
+    };
+
     // `name`/`description` come from the verbatim frontmatter block.
     let Some(frontmatter) = raw.frontmatter else {
         warn!(server, "skipping skill entry with no `frontmatter`");
@@ -413,24 +479,38 @@ fn parse_entry(server: &str, raw: WireSkillEntry) -> Option<McpSkillEntry> {
     }
 
     let resources = match raw.resources {
-        None => None,
-        Some(refs) => {
+        WireResources::Marker(marker) => {
+            if marker != "dynamic" {
+                warn!(
+                    server,
+                    name,
+                    marker,
+                    "skipping skill entry whose `resources` is neither an array nor \"dynamic\""
+                );
+                return None;
+            }
+            SkillResources::Dynamic
+        }
+        WireResources::Manifest(refs) => {
             let mut parsed = Vec::with_capacity(refs.len());
             for r in refs {
-                if r.uri.is_empty() || r.digest.is_empty() {
-                    // An incomplete `resources` set cannot honor the SEP's
-                    // completeness guarantee, so the whole entry is dropped
-                    // rather than silently degrading to unverified reads.
-                    warn!(
-                        server,
-                        name,
-                        "skipping skill entry with a malformed resources element (missing uri or digest)"
-                    );
-                    return None;
-                }
+                let size = match r.size {
+                    Some(size) if !r.uri.is_empty() && !r.digest.is_empty() => size,
+                    _ => {
+                        // An incomplete manifest is dropped whole rather than
+                        // degrading to unverified reads.
+                        warn!(
+                            server,
+                            name,
+                            "skipping skill entry with a malformed resources element (missing uri, digest, or size)"
+                        );
+                        return None;
+                    }
+                };
                 parsed.push(SkillResourceRef {
                     uri: r.uri,
                     digest: r.digest,
+                    size,
                 });
             }
             if !parsed.iter().any(|r| r.uri == uri) {
@@ -442,7 +522,7 @@ fn parse_entry(server: &str, raw: WireSkillEntry) -> Option<McpSkillEntry> {
                 );
                 return None;
             }
-            Some(parsed)
+            SkillResources::Manifest(parsed)
         }
     };
 
@@ -554,9 +634,14 @@ mod tests {
             _cancel_token: CancellationToken,
         ) -> Result<SkillsGetResult, Error> {
             match self.get_entries.get(uri) {
+                // A doc with a "skill" key is a full result (may carry
+                // resultType); otherwise it's a bare entry.
+                Some(doc) if doc.get("skill").is_some() => {
+                    serde_json::from_value(doc.clone()).map_err(|_| Error::UnexpectedResponse)
+                }
                 Some(doc) => Ok(SkillsGetResult {
-                    skill: serde_json::from_value(doc.clone())
-                        .map_err(|_| Error::UnexpectedResponse)?,
+                    result_type: None,
+                    skill: doc.clone(),
                 }),
                 None => Err(Error::TransportClosed),
             }
@@ -567,7 +652,7 @@ mod tests {
         serde_json::json!({
             "uri": uri,
             "frontmatter": {"name": name, "description": format!("{} description", name)},
-            "resources": [{"uri": uri, "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"}],
+            "resources": [{"uri": uri, "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000", "size": 64}],
         })
     }
 
@@ -627,10 +712,11 @@ mod tests {
             description: String::new(),
             uri: uri.into(),
             frontmatter: serde_json::json!({"name": "s", "description": ""}),
-            resources: Some(vec![SkillResourceRef {
+            resources: SkillResources::Manifest(vec![SkillResourceRef {
                 uri: uri.into(),
                 digest: "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
                     .into(),
+                size: 5,
             }]),
         };
 
@@ -638,8 +724,10 @@ mod tests {
         assert!(entry.verify_read(uri, b"tampered").is_err());
         // Unlisted file within a held skill = verification failure.
         assert!(entry.verify_read("skill://s/extra.md", b"x").is_err());
-        // Dynamic skill (no resources): nothing to verify.
-        entry.resources = None;
+        let err = entry.verify_read(uri, b"hell").unwrap_err();
+        assert!(err.contains("size mismatch"), "got: {err}");
+        // Dynamic skill: nothing to verify.
+        entry.resources = SkillResources::Dynamic;
         assert!(entry.verify_read("skill://s/extra.md", b"x").is_ok());
     }
 
@@ -651,7 +739,7 @@ mod tests {
             description: String::new(),
             uri: "skill://s/SKILL.md".into(),
             frontmatter: serde_json::json!({"name": "s", "description": "d", "license": "MIT"}),
-            resources: None,
+            resources: SkillResources::Dynamic,
         };
         assert!(entry
             .verify_frontmatter(
@@ -787,14 +875,19 @@ mod tests {
                 {
                     "uri": "skill://broken/SKILL.md",
                     "frontmatter": {"name": "broken", "description": ""},
-                    // Missing digest → incomplete resources → entry dropped.
+                    // Missing digest and size → entry dropped.
                     "resources": [{"uri": "skill://broken/SKILL.md"}],
+                },
+                {
+                    "uri": "skill://no-size/SKILL.md",
+                    "frontmatter": {"name": "no-size", "description": ""},
+                    "resources": [{"uri": "skill://no-size/SKILL.md", "digest": "sha256:aa"}],
                 },
                 {
                     "uri": "skill://no-self/SKILL.md",
                     "frontmatter": {"name": "no-self", "description": ""},
                     // Omits the SKILL.md entry itself → dropped.
-                    "resources": [{"uri": "skill://no-self/other.md", "digest": "sha256:aa"}],
+                    "resources": [{"uri": "skill://no-self/other.md", "digest": "sha256:aa", "size": 1}],
                 },
                 entry_json("clean", "skill://clean/SKILL.md"),
             ]
@@ -811,11 +904,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_accepts_dynamic_skill_without_resources() {
+    async fn test_discover_accepts_explicit_dynamic_marker() {
         let server = FakeSkillsServer::single_page(serde_json::json!({
             "skills": [{
                 "uri": "skill://dynamic/SKILL.md",
                 "frontmatter": {"name": "dynamic", "description": "generated"},
+                "resources": "dynamic",
             }]
         }));
         let skills = fetch_server_skills(
@@ -826,7 +920,100 @@ mod tests {
         )
         .await;
         assert_eq!(skills.skills.len(), 1);
-        assert!(skills.skills[0].resources.is_none());
+        assert_eq!(skills.skills[0].resources, SkillResources::Dynamic);
+    }
+
+    #[tokio::test]
+    async fn test_discover_rejects_invalid_resources_keeps_rest() {
+        // Per SEP §Resources: absent `resources`, a string other than
+        // "dynamic", or a non-array/non-string value all invalidate the
+        // entry — without sinking the rest of the page.
+        let server = FakeSkillsServer::single_page(serde_json::json!({
+            "skills": [
+                {
+                    "uri": "skill://absent/SKILL.md",
+                    "frontmatter": {"name": "absent", "description": ""},
+                },
+                {
+                    "uri": "skill://wrong-marker/SKILL.md",
+                    "frontmatter": {"name": "wrong-marker", "description": ""},
+                    "resources": "generated",
+                },
+                {
+                    "uri": "skill://wrong-type/SKILL.md",
+                    "frontmatter": {"name": "wrong-type", "description": ""},
+                    "resources": 42,
+                },
+                entry_json("clean", "skill://clean/SKILL.md"),
+            ]
+        }));
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.skills.len(), 1);
+        assert_eq!(skills.skills[0].name, "clean");
+    }
+
+    #[tokio::test]
+    async fn test_result_type_complete_accepted_unrecognized_invalid() {
+        let complete = FakeSkillsServer::single_page(serde_json::json!({
+            "resultType": "complete",
+            "skills": [entry_json("ok", "skill://ok/SKILL.md")],
+        }));
+        let skills = fetch_server_skills(
+            "srv",
+            &complete as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.skills.len(), 1);
+
+        // An unrecognized resultType invalidates the whole listing rather
+        // than parsing as if complete.
+        let unrecognized = FakeSkillsServer::single_page(serde_json::json!({
+            "resultType": "input_required",
+            "skills": [entry_json("ok", "skill://ok/SKILL.md")],
+        }));
+        let skills = fetch_server_skills(
+            "srv",
+            &unrecognized as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(skills.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_skill_entry_rejects_unrecognized_result_type() {
+        let uri = "skill://x/SKILL.md";
+        let server = FakeSkillsServer {
+            info: FakeSkillsServer::with_capability(),
+            list_pages: HashMap::new(),
+            get_entries: HashMap::from([(
+                uri.to_string(),
+                serde_json::json!({
+                    "resultType": "input_required",
+                    "skill": entry_json("x", uri),
+                }),
+            )]),
+            delay: None,
+        };
+        let err = fetch_skill_entry(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            uri,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("resultType"), "got: {err}");
     }
 
     #[tokio::test]
