@@ -51,6 +51,8 @@ pub type Error = rmcp::ServiceError;
 
 const MCP_APPS_UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
 const MCP_APPS_UI_MIME_TYPE: &str = "text/html;profile=mcp-app";
+/// Nested MCP Apps setting that opts a peer in to app-rendered elicitation (SEP-3118).
+const MCP_APPS_UI_ELICITATION_SETTING: &str = "elicitation";
 
 fn resolve_sampling_model_config() -> anyhow::Result<goose_providers::model::ModelConfig> {
     let config = crate::config::Config::global();
@@ -90,6 +92,16 @@ fn is_absolute_ui_uri(uri: &str) -> bool {
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     !authority.is_empty()
+}
+
+/// Whether a peer declared `io.modelcontextprotocol/ui.elicitation`.
+///
+/// Both sides must declare it. Supporting MCP Apps is not enough on its own,
+/// so an older Apps peer never receives a hint it cannot route.
+fn declares_ui_elicitation(extensions: Option<&ExtensionCapabilities>) -> bool {
+    extensions
+        .and_then(|extensions| extensions.get(MCP_APPS_UI_EXTENSION_ID))
+        .is_some_and(|settings| settings.contains_key(MCP_APPS_UI_ELICITATION_SETTING))
 }
 
 fn default_mcp_apps_ui_extensions() -> ExtensionCapabilities {
@@ -361,6 +373,21 @@ impl GooseClient {
         ExtensionCapabilities::new()
     }
 
+    /// Whether app-rendered elicitation was negotiated with this server.
+    ///
+    /// Requires the setting on both sides. A host that cannot render an app
+    /// elicitation never declares it, so its elicitations stay native forms.
+    fn server_declares_ui_elicitation(&self, context: &RequestContext<RoleClient>) -> bool {
+        if !declares_ui_elicitation(Some(&self.resolved_extensions())) {
+            return false;
+        }
+
+        context
+            .peer
+            .peer_info()
+            .is_some_and(|info| declares_ui_elicitation(info.capabilities.extensions.as_ref()))
+    }
+
     fn resolved_client_info(&self) -> Implementation {
         let name = self
             .capabilities
@@ -564,7 +591,11 @@ impl ClientHandler for GooseClient {
                         None,
                     )
                 })?;
-                let app_ui = elicitation_app_ui(meta.as_ref(), &self.capabilities.extension_name);
+                let app_ui = if self.server_declares_ui_elicitation(&context) {
+                    elicitation_app_ui(meta.as_ref(), &self.capabilities.extension_name)
+                } else {
+                    None
+                };
                 (message.clone(), schema_value, app_ui)
             }
             ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
@@ -1234,6 +1265,46 @@ mod tests {
         }));
 
         assert!(elicitation_app_ui(Some(&meta), "mind-maze").is_none());
+    }
+
+    fn ui_extensions(settings: serde_json::Value) -> ExtensionCapabilities {
+        let serde_json::Value::Object(settings) = settings else {
+            panic!("settings must be an object");
+        };
+        let mut extensions = ExtensionCapabilities::new();
+        extensions.insert(MCP_APPS_UI_EXTENSION_ID.to_string(), settings);
+        extensions
+    }
+
+    #[test]
+    fn ui_elicitation_is_declared_only_by_the_nested_setting() {
+        let declared = ui_extensions(serde_json::json!({
+            "mimeTypes": [MCP_APPS_UI_MIME_TYPE],
+            "elicitation": {},
+        }));
+        assert!(declares_ui_elicitation(Some(&declared)));
+    }
+
+    #[test]
+    fn mcp_apps_support_alone_does_not_declare_ui_elicitation() {
+        let mime_only = ui_extensions(serde_json::json!({
+            "mimeTypes": [MCP_APPS_UI_MIME_TYPE],
+        }));
+        assert!(!declares_ui_elicitation(Some(&mime_only)));
+        assert!(!declares_ui_elicitation(
+            Some(&ExtensionCapabilities::new())
+        ));
+        assert!(!declares_ui_elicitation(None));
+    }
+
+    #[test]
+    fn goose_declares_ui_elicitation_only_when_the_host_asks_for_it() {
+        // The Rust default covers hosts that enable MCP Apps without listing
+        // their own extension settings. It must not opt them in to rendering
+        // elicitations they have no UI for.
+        assert!(!declares_ui_elicitation(Some(
+            &default_mcp_apps_ui_extensions()
+        )));
     }
 
     #[test]

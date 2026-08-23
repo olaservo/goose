@@ -14,6 +14,8 @@ export const GOOSE_MCP_UI_EXTENSION_ID = "io.modelcontextprotocol/ui" as const;
 
 export interface GooseMcpUiExtensionSettings {
   mimeTypes: string[];
+  /** Present when the host can render form elicitations with an MCP App (SEP-3118). */
+  elicitation?: Record<string, never>;
 }
 
 export interface GooseMcpHostCapabilities {
@@ -68,6 +70,10 @@ export const DEFAULT_GOOSE_MCP_HOST_CAPABILITIES: GooseMcpHostCapabilities = {
   extensions: {
     [GOOSE_MCP_UI_EXTENSION_ID]: {
       mimeTypes: [RESOURCE_MIME_TYPE],
+      // Opts in to app-rendered form elicitations (SEP-3118). Servers only
+      // nominate an app when both sides declare this, so a host that cannot
+      // render one keeps getting native forms.
+      elicitation: {},
     },
   },
 };
