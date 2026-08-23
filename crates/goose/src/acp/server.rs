@@ -102,6 +102,7 @@ mod diagnostics;
 mod dictation;
 mod dispatch;
 mod elicitation;
+use elicitation::elicitation_meta;
 mod extensions;
 mod fork_session;
 mod list_sessions;
@@ -1270,6 +1271,7 @@ impl GooseAcpAgent {
                     id,
                     message: elicitation_message,
                     requested_schema,
+                    app_ui,
                 } => {
                     self.handle_form_elicitation(
                         cx,
@@ -1277,7 +1279,7 @@ impl GooseAcpAgent {
                         id,
                         elicitation_message,
                         requested_schema,
-                        message_meta_without_steer(message),
+                        elicitation_meta(message_meta_without_steer(message), app_ui.as_ref()),
                     )
                     .await?;
                 }

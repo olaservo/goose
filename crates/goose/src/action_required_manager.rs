@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::conversation::message::{Message, MessageContent};
+use crate::conversation::message::{ElicitationAppUi, Message, MessageContent};
 
 const ACTION_REQUIRED_STREAM_CAPACITY: usize = 8;
 
@@ -65,6 +65,7 @@ impl ActionRequiredManager {
         tool_call_request_id: String,
         message: String,
         schema: Value,
+        app_ui: Option<ElicitationAppUi>,
         timeout_duration: Duration,
     ) -> Result<ElicitationOutcome> {
         let sender = self
@@ -95,7 +96,7 @@ impl ActionRequiredManager {
             .insert(id.clone(), Arc::clone(&pending_request));
 
         let action_required_message = Message::assistant().with_content(
-            MessageContent::action_required_elicitation(id.clone(), message, schema),
+            MessageContent::action_required_elicitation(id.clone(), message, schema, app_ui),
         );
         if let Err(error) = sender.try_send(action_required_message) {
             self.pending.write().await.remove(&id);
@@ -267,6 +268,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -314,6 +316,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input A".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -328,6 +331,7 @@ mod tests {
                         "tool-call-b".to_string(),
                         "Need input B".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -382,6 +386,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input A".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -396,6 +401,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input B".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -445,6 +451,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_millis(25),
                     )
                     .await
@@ -489,6 +496,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Need input A".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -503,6 +511,7 @@ mod tests {
                         "tool-call-b".to_string(),
                         "Need input B".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await
@@ -547,6 +556,7 @@ mod tests {
                 "missing-tool-call".to_string(),
                 "Need input".to_string(),
                 json!({ "type": "object" }),
+                None,
                 Duration::from_secs(5),
             )
             .await;
@@ -571,6 +581,7 @@ mod tests {
                 "tool-call-a".to_string(),
                 "Need input".to_string(),
                 json!({ "type": "object" }),
+                None,
                 Duration::from_secs(5),
             )
             .await;
@@ -595,6 +606,7 @@ mod tests {
                     "tool-call-a".to_string(),
                     format!("Fill queue {index}"),
                     json!({ "type": "object" }),
+                    None,
                     Duration::ZERO,
                 )
                 .await;
@@ -610,6 +622,7 @@ mod tests {
                 "tool-call-a".to_string(),
                 "Rejected while queue is full".to_string(),
                 json!({ "type": "object" }),
+                None,
                 Duration::from_secs(5),
             ),
         )
@@ -632,6 +645,7 @@ mod tests {
                         "tool-call-a".to_string(),
                         "Admitted after capacity is available".to_string(),
                         json!({ "type": "object" }),
+                        None,
                         Duration::from_secs(5),
                     )
                     .await

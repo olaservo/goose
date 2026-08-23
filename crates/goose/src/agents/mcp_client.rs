@@ -2,6 +2,7 @@ use crate::action_required_manager::{ActionRequiredManager, ElicitationOutcome};
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::tool_execution::ToolCallContext;
 use crate::agents::types::SharedProvider;
+use crate::conversation::message::ElicitationAppUi;
 use crate::session_context::{SESSION_ID_HEADER, TOOL_CALL_REQUEST_ID_HEADER, WORKING_DIR_HEADER};
 /// MCP client implementation for Goose
 #[expect(deprecated)]
@@ -42,6 +43,7 @@ use tokio::sync::{
     Mutex,
 };
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 pub type BoxError = Box<dyn std::error::Error + Sync + Send>;
 
@@ -55,6 +57,39 @@ fn resolve_sampling_model_config() -> anyhow::Result<goose_providers::model::Mod
     let provider_name = config.get_goose_provider()?;
     let model_name = config.get_goose_model()?;
     crate::model_config::model_config_from_user_config(&provider_name, &model_name)
+}
+
+/// Read the MCP App a server nominated to render a form elicitation
+/// (`_meta.ui.resourceUri`, SEP-3118).
+///
+/// The hint is advisory. Anything malformed is dropped so the elicitation still
+/// renders as a native form.
+fn elicitation_app_ui(
+    meta: Option<&rmcp::model::RequestMetaObject>,
+    extension_name: &str,
+) -> Option<ElicitationAppUi> {
+    let resource_uri = meta?.0.get("ui")?.get("resourceUri")?.as_str()?;
+
+    if !is_absolute_ui_uri(resource_uri) {
+        warn!(
+            extension_name,
+            resource_uri, "Ignoring elicitation UI hint that is not an absolute ui:// URI"
+        );
+        return None;
+    }
+
+    Some(ElicitationAppUi {
+        resource_uri: resource_uri.to_string(),
+        extension_name: extension_name.to_string(),
+    })
+}
+
+fn is_absolute_ui_uri(uri: &str) -> bool {
+    let Some(rest) = uri.strip_prefix("ui://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !authority.is_empty()
 }
 
 fn default_mcp_apps_ui_extensions() -> ExtensionCapabilities {
@@ -516,11 +551,11 @@ impl ClientHandler for GooseClient {
         let tool_call_request_id =
             self.resolve_tool_call_request_id(&session_id, &context.extensions)?;
 
-        let (message, schema_value) = match &request {
+        let (message, schema_value, app_ui) = match &request {
             ElicitRequestParams::FormElicitationParams {
+                meta,
                 message,
                 requested_schema,
-                ..
             } => {
                 let schema_value = serde_json::to_value(requested_schema).map_err(|e| {
                     ErrorData::new(
@@ -529,12 +564,13 @@ impl ClientHandler for GooseClient {
                         None,
                     )
                 })?;
-                (message.clone(), schema_value)
+                let app_ui = elicitation_app_ui(meta.as_ref(), &self.capabilities.extension_name);
+                (message.clone(), schema_value, app_ui)
             }
             ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
-                (message.clone(), serde_json::json!({ "url": url }))
+                (message.clone(), serde_json::json!({ "url": url }), None)
             }
-            _ => (String::new(), serde_json::json!({})),
+            _ => (String::new(), serde_json::json!({}), None),
         };
 
         self.action_required
@@ -543,6 +579,7 @@ impl ClientHandler for GooseClient {
                 tool_call_request_id,
                 message,
                 schema_value,
+                app_ui,
                 Duration::from_secs(300),
             )
             .await
@@ -588,6 +625,9 @@ pub type ElicitationHandler = Arc<dyn Fn(&ElicitRequestParams) -> ElicitResult +
 
 #[derive(Clone, Default)]
 pub struct GooseMcpClientCapabilities {
+    /// Extension this client is connected to, used to resolve `ui://` resources
+    /// back to the server that asked for them.
+    pub extension_name: String,
     pub mcpui: bool,
     pub host_info: Option<GooseMcpHostInfo>,
     pub elicitation_handler: Option<ElicitationHandler>,
@@ -1153,6 +1193,57 @@ fn inject_session_context_into_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request_meta(value: serde_json::Value) -> rmcp::model::RequestMetaObject {
+        let serde_json::Value::Object(map) = value else {
+            panic!("meta must be an object");
+        };
+        rmcp::model::RequestMetaObject(MetaObject(map))
+    }
+
+    #[test]
+    fn elicitation_app_ui_reads_the_mcp_apps_hint() {
+        let meta = request_meta(serde_json::json!({
+            "ui": { "resourceUri": "ui://mind-maze/mcp-app.html" }
+        }));
+
+        let app_ui = elicitation_app_ui(Some(&meta), "mind-maze").expect("hint should be read");
+
+        assert_eq!(app_ui.resource_uri, "ui://mind-maze/mcp-app.html");
+        assert_eq!(app_ui.extension_name, "mind-maze");
+    }
+
+    #[test]
+    fn elicitation_app_ui_is_absent_without_metadata() {
+        assert!(elicitation_app_ui(None, "mind-maze").is_none());
+
+        let empty = request_meta(serde_json::json!({}));
+        assert!(elicitation_app_ui(Some(&empty), "mind-maze").is_none());
+
+        let no_uri = request_meta(serde_json::json!({ "ui": {} }));
+        assert!(elicitation_app_ui(Some(&no_uri), "mind-maze").is_none());
+    }
+
+    #[test_case("https://example.com/app.html" ; "http scheme")]
+    #[test_case("ui:mind-maze/app.html" ; "not absolute")]
+    #[test_case("ui://" ; "empty authority")]
+    #[test_case("ui:///app.html" ; "missing authority")]
+    fn elicitation_app_ui_rejects_uris_that_are_not_absolute_ui(resource_uri: &str) {
+        let meta = request_meta(serde_json::json!({
+            "ui": { "resourceUri": resource_uri }
+        }));
+
+        assert!(elicitation_app_ui(Some(&meta), "mind-maze").is_none());
+    }
+
+    #[test]
+    fn elicitation_app_ui_rejects_a_non_string_uri() {
+        let meta = request_meta(serde_json::json!({
+            "ui": { "resourceUri": 42 }
+        }));
+
+        assert!(elicitation_app_ui(Some(&meta), "mind-maze").is_none());
+    }
     use crate::agents::extension::ExtensionConfig;
     use crate::agents::GoosePlatform;
     use rmcp::model::Tool;
@@ -1213,12 +1304,14 @@ mod tests {
     fn new_client(platform: GoosePlatform) -> GooseClient {
         let capabilities = match platform {
             GoosePlatform::GooseDesktop => GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: true,
                 host_info: None,
                 elicitation_handler: None,
                 protocol_version: None,
             },
             GoosePlatform::GooseCli => GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: false,
                 host_info: None,
                 elicitation_handler: None,
@@ -1271,6 +1364,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             "goose-test".to_string(),
             GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: false,
                 host_info: None,
                 elicitation_handler: None,
@@ -1644,6 +1738,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             GoosePlatform::GooseDesktop.to_string(),
             GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: true,
                 host_info: Some(GooseMcpHostInfo {
                     explicit_extensions: true,
@@ -1679,6 +1774,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             GoosePlatform::GooseCli.to_string(),
             GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: false,
                 host_info: Some(GooseMcpHostInfo {
                     explicit_extensions: true,
@@ -1711,6 +1807,7 @@ mod tests {
             Arc::new(Mutex::new(None)),
             GoosePlatform::GooseDesktop.to_string(),
             GooseMcpClientCapabilities {
+                extension_name: "test-extension".to_string(),
                 mcpui: true,
                 host_info: Some(GooseMcpHostInfo {
                     explicit_extensions: false,

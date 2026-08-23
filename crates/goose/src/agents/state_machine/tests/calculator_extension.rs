@@ -185,6 +185,7 @@ impl McpClientTrait for CalculatorExtension {
                     tool_call_request_id,
                     "What value should I use?".to_string(),
                     schema,
+                    None,
                     std::time::Duration::from_secs(10),
                 )
                 .await

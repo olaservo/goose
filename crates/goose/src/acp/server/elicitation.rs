@@ -11,7 +11,26 @@ use agent_client_protocol::{
 use tracing::warn;
 
 use crate::action_required_manager::ElicitationOutcome;
+use crate::conversation::message::ElicitationAppUi;
 use crate::session::SessionManager;
+
+/// Carry the MCP App hint to the ACP client under `_meta.ui`.
+///
+/// `resourceUri` mirrors the MCP Apps metadata the server sent. `extensionName`
+/// is added so the client reads the resource from the originating server rather
+/// than resolving the URI against some other connection.
+pub(super) fn elicitation_meta(mut meta: Meta, app_ui: Option<&ElicitationAppUi>) -> Meta {
+    if let Some(app_ui) = app_ui {
+        meta.insert(
+            "ui".to_string(),
+            serde_json::json!({
+                "resourceUri": app_ui.resource_uri,
+                "extensionName": app_ui.extension_name,
+            }),
+        );
+    }
+    meta
+}
 
 impl super::GooseAcpAgent {
     pub(super) async fn handle_form_elicitation(

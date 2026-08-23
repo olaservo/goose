@@ -185,6 +185,18 @@ pub struct ToolConfirmationRequest {
     pub prompt: Option<String>,
 }
 
+/// MCP App nominated by a server to render a form elicitation, from
+/// `_meta.ui.resourceUri` on the `elicitation/create` request.
+///
+/// The schema stays authoritative: this only says who may draw the form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ElicitationAppUi {
+    pub resource_uri: String,
+    /// Extension the resource is read from. The app must come from the server
+    /// that sent the elicitation.
+    pub extension_name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "actionType", rename_all = "camelCase")]
 pub enum ActionRequiredData {
@@ -199,6 +211,8 @@ pub enum ActionRequiredData {
         id: String,
         message: String,
         requested_schema: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_ui: Option<ElicitationAppUi>,
     },
     ElicitationResponse {
         id: String,
@@ -513,12 +527,14 @@ impl MessageContentBlock {
         id: S,
         message: String,
         requested_schema: serde_json::Value,
+        app_ui: Option<ElicitationAppUi>,
     ) -> Self {
         MessageContentBlock::ActionRequired(ActionRequired {
             data: ActionRequiredData::Elicitation {
                 id: id.into(),
                 message,
                 requested_schema,
+                app_ui,
             },
         })
     }

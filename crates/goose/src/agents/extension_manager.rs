@@ -1366,8 +1366,9 @@ async fn create_unix_socket_http_client(
 }
 
 impl ExtensionManager {
-    fn mcp_client_capabilities(&self) -> GooseMcpClientCapabilities {
+    fn mcp_client_capabilities(&self, extension_name: &str) -> GooseMcpClientCapabilities {
         GooseMcpClientCapabilities {
+            extension_name: extension_name.to_string(),
             mcpui: self.capabilities.mcpui,
             host_info: self.capabilities.host_info.clone(),
             elicitation_handler: self.capabilities.elicitation_handler.clone(),
@@ -1513,7 +1514,7 @@ impl ExtensionManager {
                     Box::new(GooseCredentialStore::new(name.to_string())),
                     self.provider.clone(),
                     self.client_name.clone(),
-                    self.mcp_client_capabilities(),
+                    self.mcp_client_capabilities(&sanitized_name),
                     &effective_working_dir,
                     self.context.session_manager.action_required(),
                     Arc::downgrade(self),
@@ -1578,7 +1579,7 @@ impl ExtensionManager {
                             &effective_working_dir,
                             Some(container_id.to_string()),
                             self.client_name.clone(),
-                            self.mcp_client_capabilities(),
+                            self.mcp_client_capabilities(&sanitized_name),
                             self.context.session_manager.action_required(),
                             Arc::downgrade(self),
                         )
@@ -1595,7 +1596,7 @@ impl ExtensionManager {
                                 Duration::from_secs(timeout_secs),
                                 self.provider.clone(),
                                 self.client_name.clone(),
-                                self.mcp_client_capabilities(),
+                                self.mcp_client_capabilities(&sanitized_name),
                                 effective_working_dir.clone(),
                                 self.context.session_manager.action_required(),
                                 Arc::downgrade(self),
@@ -1659,7 +1660,7 @@ impl ExtensionManager {
                     &process_working_dir,
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
-                    self.mcp_client_capabilities(),
+                    self.mcp_client_capabilities(&sanitized_name),
                     self.context.session_manager.action_required(),
                     Arc::downgrade(self),
                 )
@@ -1693,7 +1694,7 @@ impl ExtensionManager {
                     &effective_working_dir,
                     container.map(|c| c.id().to_string()),
                     self.client_name.clone(),
-                    self.mcp_client_capabilities(),
+                    self.mcp_client_capabilities(&sanitized_name),
                     self.context.session_manager.action_required(),
                     Arc::downgrade(self),
                 )
@@ -4113,6 +4114,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let provider: SharedProvider = Arc::new(Mutex::new(None));
         let capabilities = GooseMcpClientCapabilities {
+            extension_name: "test-extension".to_string(),
             mcpui: false,
             host_info: None,
             elicitation_handler: None,
@@ -4153,6 +4155,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let provider: SharedProvider = Arc::new(Mutex::new(None));
         let capabilities = GooseMcpClientCapabilities {
+            extension_name: "test-extension".to_string(),
             mcpui: false,
             host_info: None,
             elicitation_handler: None,
@@ -4202,6 +4205,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let provider: SharedProvider = Arc::new(Mutex::new(None));
         let capabilities = GooseMcpClientCapabilities {
+            extension_name: "test-extension".to_string(),
             mcpui: false,
             host_info: None,
             elicitation_handler: None,
@@ -4290,6 +4294,7 @@ mod tests {
         let temp_dir = tempdir().unwrap();
         let provider: SharedProvider = Arc::new(Mutex::new(None));
         let capabilities = GooseMcpClientCapabilities {
+            extension_name: "test-extension".to_string(),
             mcpui: false,
             host_info: None,
             elicitation_handler: None,
