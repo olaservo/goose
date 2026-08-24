@@ -3626,7 +3626,7 @@ mod tests {
                         "properties": { "result": { "type": "string" } }
                     })),
                 })
-                .await;
+                .await?;
 
             let reply_stream = agent
                 .reply(
@@ -3693,7 +3693,7 @@ mod tests {
                         "properties": { "result": { "type": "string" } }
                     })),
                 })
-                .await;
+                .await?;
 
             let session_config = SessionConfig {
                 id: session.id.clone(),
@@ -3811,7 +3811,7 @@ mod tests {
                         "required": ["result"]
                     })),
                 })
-                .await;
+                .await?;
 
             let session_config = SessionConfig {
                 id: session.id,
