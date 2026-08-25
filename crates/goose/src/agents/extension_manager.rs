@@ -1093,6 +1093,62 @@ impl McpClientTrait for OAuthStepUpClient {
         .await
     }
 
+    async fn directory_read(
+        &self,
+        session_id: &str,
+        uri: &str,
+        cursor: Option<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<rmcp::model::ListResourcesResult, crate::agents::mcp_client::Error> {
+        let session_id = session_id.to_string();
+        let uri = uri.to_string();
+        self.with_step_up_retry(move |client| {
+            let session_id = session_id.clone();
+            let uri = uri.clone();
+            let cursor = cursor.clone();
+            let cancel_token = cancel_token.clone();
+            Box::pin(async move {
+                client
+                    .directory_read(&session_id, &uri, cursor, cancel_token)
+                    .await
+            })
+        })
+        .await
+    }
+
+    async fn skills_list(
+        &self,
+        session_id: &str,
+        cursor: Option<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsListResult, crate::agents::mcp_client::Error> {
+        let session_id = session_id.to_string();
+        self.with_step_up_retry(move |client| {
+            let session_id = session_id.clone();
+            let cursor = cursor.clone();
+            let cancel_token = cancel_token.clone();
+            Box::pin(async move { client.skills_list(&session_id, cursor, cancel_token).await })
+        })
+        .await
+    }
+
+    async fn skills_get(
+        &self,
+        session_id: &str,
+        uri: &str,
+        cancel_token: CancellationToken,
+    ) -> Result<crate::skills::mcp_client::SkillsGetResult, crate::agents::mcp_client::Error> {
+        let session_id = session_id.to_string();
+        let uri = uri.to_string();
+        self.with_step_up_retry(move |client| {
+            let session_id = session_id.clone();
+            let uri = uri.clone();
+            let cancel_token = cancel_token.clone();
+            Box::pin(async move { client.skills_get(&session_id, &uri, cancel_token).await })
+        })
+        .await
+    }
+
     async fn list_prompts(
         &self,
         session_id: &str,
