@@ -25,8 +25,10 @@ pub fn parse_frontmatter<T: for<'de> Deserialize<'de>>(
         return Ok(None);
     }
 
-    let yaml_content = parts[1].trim();
-    let metadata: T = serde_yaml::from_str(yaml_content)?;
+    // Parse the frontmatter as written. Trimming it first strips the final
+    // newline of a trailing block scalar (`key: |`), and SEP-2640 hosts
+    // compare this value field-by-field against the server's entry.
+    let metadata: T = serde_yaml::from_str(parts[1])?;
 
     let body = parts[2..].join("---").trim().to_string();
     Ok(Some((metadata, body)))
@@ -1230,6 +1232,15 @@ pub fn import_sources(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_frontmatter_keeps_trailing_block_scalar_newline() {
+        let raw = "---\nname: s\nnote: |\n  first\n  second\n---\n\nBody\n";
+        let (meta, body): (serde_json::Value, String) = parse_frontmatter(raw).unwrap().unwrap();
+        assert_eq!(meta["name"], "s");
+        assert_eq!(meta["note"], "first\nsecond\n");
+        assert_eq!(body, "Body");
+    }
 
     #[test]
     fn skill_name_validation() {
