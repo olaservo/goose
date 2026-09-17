@@ -22,13 +22,60 @@ impl GooseAcpAgent {
         &self,
         req: ListSourcesRequest,
     ) -> Result<ListSourcesResponse, agent_client_protocol::Error> {
-        let sources = crate::sources::list_sources_with_roots(
+        let mut sources = crate::sources::list_sources_with_roots(
             req.source_type,
             req.project_dir.as_deref(),
             req.include_project_sources,
             &self.additional_source_roots,
         )?;
+        if matches!(req.source_type, None | Some(SourceType::Skill)) {
+            sources.extend(self.live_mcp_skill_sources().await);
+        }
         Ok(ListSourcesResponse { sources })
+    }
+
+    /// MCP-served skills exist only in a live session's extension manager, so
+    /// they are listed from every open session and deduplicated by URI.
+    async fn live_mcp_skill_sources(&self) -> Vec<SourceEntry> {
+        let agents: Vec<(String, Arc<Agent>)> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .map(|(id, session)| (id.clone(), session.agent.clone()))
+            .collect();
+
+        let mut seen = HashSet::new();
+        let mut sources = Vec::new();
+        for (session_id, agent) in agents {
+            for entry in agent.extension_manager.aggregated_mcp_skills().await {
+                if !seen.insert((entry.server.clone(), entry.uri.clone())) {
+                    continue;
+                }
+                let attribution =
+                    crate::skills::attribution::grade_entry(&entry, &session_id).await;
+                let properties = HashMap::from([
+                    ("mcpServer".to_string(), serde_json::json!(entry.server)),
+                    (
+                        "complianceStatus".to_string(),
+                        serde_json::json!(attribution.compliance),
+                    ),
+                    (
+                        "attributionSummary".to_string(),
+                        serde_json::json!(attribution.summary),
+                    ),
+                ]);
+                sources.push(SourceEntry {
+                    source_type: SourceType::Skill,
+                    name: entry.name,
+                    description: entry.description,
+                    path: entry.uri,
+                    properties,
+                    ..Default::default()
+                });
+            }
+        }
+        sources
     }
 
     pub(super) async fn on_update_source(

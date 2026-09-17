@@ -1,3 +1,4 @@
+use super::attribution;
 use super::discover_skills_with_config;
 use super::loaded_skill_context_with_args;
 use super::mcp_client::McpSkillEntry;
@@ -459,17 +460,23 @@ impl LoadFailure {
     }
 }
 
+/// `body` is the SKILL.md with its frontmatter block stripped, matching how
+/// the FS path frames skill content. `text` is the file as served, which the
+/// attribution grader needs.
+struct VerifiedSkillMd {
+    text: String,
+    body: String,
+}
+
 /// Reads and fully verifies an entry's `SKILL.md`, per SEP §Integrity and
 /// verification: digest check against the entry's `resources` (when
 /// carried) and the mandatory field-by-field frontmatter identity check.
-/// Returns the SKILL.md body with its frontmatter block stripped, matching
-/// how the FS path frames skill content.
 async fn fetch_verified_skill_md(
     mgr: &ExtensionManager,
     session_id: &str,
     entry: &McpSkillEntry,
     cancel: CancellationToken,
-) -> Result<String, LoadFailure> {
+) -> Result<VerifiedSkillMd, LoadFailure> {
     let result = mgr
         .read_resource(session_id, &entry.uri, &entry.server, cancel)
         .await
@@ -507,7 +514,60 @@ async fn fetch_verified_skill_md(
         .verify_frontmatter(&fetched_frontmatter)
         .map_err(LoadFailure::Verification)?;
 
-    Ok(body)
+    Ok(VerifiedSkillMd { text, body })
+}
+
+/// Grades a verified SKILL.md through the attribution chain and caches the
+/// grade for the status surface. With `GOOSE_SKILLS_ATTRIBUTION_REQUIRE` set, a
+/// `non-compliant` skill (no author and no license) is withheld; `partial` and
+/// above still load.
+async fn enforce_skill_attribution(
+    session_id: &str,
+    uri: &str,
+    text: &str,
+    require: bool,
+) -> Option<CallToolResult> {
+    let attr = attribution::grade(uri, text, session_id).await;
+    attribution::cache_put(uri, attr.clone());
+
+    if !require || !attr.is_non_compliant() {
+        return None;
+    }
+
+    warn!(
+        uri,
+        compliance = %attr.compliance,
+        "withholding skill: no attribution declared"
+    );
+    Some(CallToolResult::error(vec![ContentBlock::text(format!(
+        "Skill '{uri}' was withheld: it declares no attribution ({}). {}",
+        attr.compliance, attr.detail
+    ))]))
+}
+
+async fn gate_and_frame_skill_md(
+    mgr: &ExtensionManager,
+    session_id: &str,
+    entry: &McpSkillEntry,
+    skill_md: VerifiedSkillMd,
+    cancel: CancellationToken,
+) -> CallToolResult {
+    if let Some(withheld) = enforce_skill_attribution(
+        session_id,
+        &entry.uri,
+        &skill_md.text,
+        attribution::enforcement_enabled(),
+    )
+    .await
+    {
+        return withheld;
+    }
+    let supporting = enumerate_mcp_supporting_resources(mgr, session_id, entry, cancel).await;
+    CallToolResult::success(vec![ContentBlock::text(frame_skill_md(
+        entry,
+        &skill_md.body,
+        &supporting,
+    ))])
 }
 
 /// Frames a loaded SKILL.md body the same way the FS path does: a
@@ -546,14 +606,8 @@ async fn load_mcp_skill_md(
 ) -> CallToolResult {
     let first_failure = match fetch_verified_skill_md(mgr, session_id, entry, cancel.clone()).await
     {
-        Ok(body) => {
-            let supporting =
-                enumerate_mcp_supporting_resources(mgr, session_id, entry, cancel).await;
-            return CallToolResult::success(vec![ContentBlock::text(frame_skill_md(
-                entry,
-                &body,
-                &supporting,
-            ))]);
+        Ok(skill_md) => {
+            return gate_and_frame_skill_md(mgr, session_id, entry, skill_md, cancel).await;
         }
         Err(failure) => failure,
     };
@@ -571,14 +625,9 @@ async fn load_mcp_skill_md(
         {
             mgr.remember_skill_entry(&entry.server, fresh.clone()).await;
             match fetch_verified_skill_md(mgr, session_id, &fresh, cancel.clone()).await {
-                Ok(body) => {
-                    let supporting =
-                        enumerate_mcp_supporting_resources(mgr, session_id, &fresh, cancel).await;
-                    return CallToolResult::success(vec![ContentBlock::text(frame_skill_md(
-                        &fresh,
-                        &body,
-                        &supporting,
-                    ))]);
+                Ok(skill_md) => {
+                    return gate_and_frame_skill_md(mgr, session_id, &fresh, skill_md, cancel)
+                        .await;
                 }
                 Err(retry_failure) => {
                     return CallToolResult::error(vec![ContentBlock::text(format!(
@@ -1584,6 +1633,63 @@ mod tests {
         let body = text_of(&result);
         assert!(body.contains("Git body text"), "got: {}", body);
         assert!(body.contains("mcp skill from gh"), "got: {}", body);
+    }
+
+    const COMPLIANT_SKILL: &str = "---
+name: demo
+license: CC-BY-4.0
+metadata:
+  skill_author: Vault-Tec
+  sources:
+    - https://example.com
+  attribution: \"Derived from the example SRD.\"
+---
+# Demo
+body
+";
+    const PARTIAL_SKILL: &str = "---
+name: noted
+description: notes
+metadata:
+  skill_author: J. Doe
+---
+# Noted
+body
+";
+    const UNCREDITED_SKILL: &str = "---
+name: wasteland
+description: encounters
+---
+# Wasteland
+body
+";
+
+    #[tokio::test]
+    async fn attribution_not_required_loads_uncredited() {
+        let result =
+            enforce_skill_attribution("s1", "skill://off/SKILL.md", UNCREDITED_SKILL, false).await;
+        assert!(result.is_none());
+        let cached = attribution::cached("skill://off/SKILL.md").unwrap();
+        assert!(cached.is_non_compliant());
+    }
+
+    #[tokio::test]
+    async fn attribution_required_withholds_uncredited() {
+        let result = enforce_skill_attribution("s1", "skill://on/SKILL.md", UNCREDITED_SKILL, true)
+            .await
+            .expect("uncredited skill must be withheld");
+        assert!(result.is_error.unwrap_or(false));
+        let text = text_of(&result);
+        assert!(text.contains("non-compliant"), "got: {}", text);
+        assert!(!text.contains("# Wasteland"), "got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn attribution_required_loads_partial_and_compliant() {
+        for skill in [PARTIAL_SKILL, COMPLIANT_SKILL] {
+            let result = enforce_skill_attribution("s1", "skill://ok/SKILL.md", skill, true).await;
+            assert!(result.is_none());
+        }
     }
 
     #[tokio::test]
