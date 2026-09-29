@@ -49,7 +49,7 @@ Written 2026-09-17 from the build of `skills-over-mcp` at `e69badcb36`. Run on W
 - To swap only the CLI binary without repackaging, copy `C:\gt\release\goose.exe` over `C:\goose-demo\resources\bin\goose.exe`. UI changes need the full package step.
 - Backup of the 2026-09-03 build: `C:\goose-demo.bak-2026-09-03` (684 MB). Delete it once the new build is confirmed.
 - Rebuilt 2026-09-24 from `e69badcb36` plus the uncommitted seal and attribution changes in the working tree. Incremental release build took 19m 44s. Backup of the 2026-09-17 build: `C:\goose-demo.bak-2026-09-17`.
-- Rebuilt 2026-09-28 from `e69badcb36` plus the uncommitted interceptor-client changes (grading moved to the Interceptor Server), now on branch `attribution-interceptors`, cut from `skills-over-mcp` at the same commit. Release builds took 13m 19s and, after the `interceptors/list` probe fix, 11m 34s. Only the CLI was swapped, into `C:\goose-demo\resources\bin\goose.exe`, with the previous binary beside it as `goose.exe.bak-2026-09-28`; the UI was unchanged since 9/24. The same binary is staged at `ui/desktop/src/bin/goose.exe`.
+- Rebuilt 2026-09-28 from `e69badcb36` plus the interceptor-client changes (grading moved to the Interceptor Server), committed as `cec081d94f` on branch `attribution-interceptors`, cut from `skills-over-mcp` at the same commit and pushed to `olaservo/goose`. `skills-over-mcp` itself is unchanged. Release builds took 13m 19s and, after the `interceptors/list` probe fix, 11m 34s. Only the CLI was swapped, into `C:\goose-demo\resources\bin\goose.exe`, with the previous binary beside it as `goose.exe.bak-2026-09-28`; the UI was unchanged since 9/24. The same binary is staged at `ui/desktop/src/bin/goose.exe`.
 
 ## Attribution demo
 
