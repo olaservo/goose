@@ -517,21 +517,52 @@ async fn fetch_verified_skill_md(
     Ok(VerifiedSkillMd { text, body })
 }
 
-/// Grades a verified SKILL.md through the attribution chain and caches the
-/// grade for the status surface. With `GOOSE_SKILLS_ATTRIBUTION_REQUIRE` set, a
-/// `non-compliant` skill (no author and no license) is withheld; `partial` and
-/// above still load.
+/// Grades a verified SKILL.md by invoking the `seal` and `attribution`
+/// validators on the configured Interceptor Server, caches the grade for the
+/// status surface, and appends one activation line. With
+/// `GOOSE_SKILLS_ATTRIBUTION_REQUIRE` set, a `non-compliant` skill (no author
+/// and no license), a skill whose seal does not verify, or a skill the
+/// Interceptor Server could not be asked about is withheld; `partial` and
+/// above with an intact or absent seal still load. Without an Interceptor
+/// Server the skill loads ungraded.
 async fn enforce_skill_attribution(
+    mgr: &ExtensionManager,
     session_id: &str,
-    uri: &str,
+    entry: &McpSkillEntry,
     text: &str,
     require: bool,
+    cancel: CancellationToken,
 ) -> Option<CallToolResult> {
-    let attr = attribution::grade(uri, text, session_id).await;
+    let uri = entry.uri.as_str();
+    let attr = attribution::grade(mgr, session_id, entry, text, cancel).await;
     attribution::cache_put(uri, attr.clone());
 
-    if !require || !attr.is_non_compliant() {
+    let withhold = require && attr.blocks();
+    attribution::log_activation(entry, &attr, if withhold { "withheld" } else { "loaded" });
+    if !withhold {
         return None;
+    }
+
+    if let Some(error) = &attr.error {
+        warn!(
+            uri,
+            error, "withholding skill: interceptor invocation failed"
+        );
+        return Some(CallToolResult::error(vec![ContentBlock::text(format!(
+            "Skill '{uri}' was withheld (mode: active): the Interceptor Server could not grade it. {error}"
+        ))]));
+    }
+
+    if attr.is_seal_mismatch() {
+        warn!(
+            uri,
+            seal = %attr.seal_summary,
+            "withholding skill: seal does not verify"
+        );
+        return Some(CallToolResult::error(vec![ContentBlock::text(format!(
+            "Skill '{uri}' was withheld (mode: active): its seal does not verify over the files the server lists now. {}",
+            attr.seal_summary
+        ))]));
     }
 
     warn!(
@@ -540,7 +571,7 @@ async fn enforce_skill_attribution(
         "withholding skill: no attribution declared"
     );
     Some(CallToolResult::error(vec![ContentBlock::text(format!(
-        "Skill '{uri}' was withheld: it declares no attribution ({}). {}",
+        "Skill '{uri}' was withheld (mode: active): it declares no attribution ({}). {}",
         attr.compliance, attr.detail
     ))]))
 }
@@ -553,10 +584,12 @@ async fn gate_and_frame_skill_md(
     cancel: CancellationToken,
 ) -> CallToolResult {
     if let Some(withheld) = enforce_skill_attribution(
+        mgr,
         session_id,
-        &entry.uri,
+        entry,
         &skill_md.text,
         attribution::enforcement_enabled(),
+        cancel.clone(),
     )
     .await
     {
@@ -1263,7 +1296,10 @@ mod tests {
 
     use crate::agents::extension::ExtensionConfig;
     use crate::agents::extension_manager::ExtensionManager;
-    use crate::skills::mcp_client::{SkillsGetResult, SkillsListResult, SKILLS_EXTENSION_ID};
+    use crate::skills::attribution::test_support::{manager_with, FakeInterceptor};
+    use crate::skills::mcp_client::{
+        sha256_digest, SkillResourceRef, SkillsGetResult, SkillsListResult, SKILLS_EXTENSION_ID,
+    };
     use async_trait::async_trait;
     use rmcp::model::{
         ExtensionCapabilities, ListResourcesResult, ReadResourceResult, Resource,
@@ -1488,13 +1524,6 @@ mod tests {
         }
     }
 
-    fn sha256_digest(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(bytes);
-        format!("sha256:{}", crate::utils::bytes_to_hex(h.finalize()))
-    }
-
     fn skill_md(name: &str, description: &str, body: &str) -> String {
         // Description is quoted so an empty string round-trips as "" rather
         // than YAML null — the frontmatter identity check is exact.
@@ -1664,10 +1693,51 @@ description: encounters
 body
 ";
 
+    fn unsealed_entry(uri: &str) -> McpSkillEntry {
+        McpSkillEntry {
+            server: "gh".to_string(),
+            name: uri
+                .trim_end_matches("/SKILL.md")
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_string(),
+            description: String::new(),
+            uri: uri.to_string(),
+            frontmatter: serde_json::json!({}),
+            resources: crate::skills::mcp_client::SkillResources::Dynamic,
+            meta: None,
+        }
+    }
+
+    async fn enforce(
+        mgr: &ExtensionManager,
+        entry: &McpSkillEntry,
+        text: &str,
+        require: bool,
+    ) -> Option<CallToolResult> {
+        enforce_skill_attribution(mgr, "s1", entry, text, require, CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn attribution_without_interceptor_server_loads_ungraded() {
+        let tmp = TempDir::new().unwrap();
+        let mgr = ExtensionManager::new_without_provider(tmp.path().to_path_buf());
+        let entry = unsealed_entry("skill://unchecked/SKILL.md");
+        for require in [false, true] {
+            assert!(enforce(&mgr, &entry, UNCREDITED_SKILL, require)
+                .await
+                .is_none());
+        }
+        let cached = attribution::cached(&entry.uri).unwrap();
+        assert_eq!(cached.compliance, attribution::UNCHECKED);
+    }
+
     #[tokio::test]
     async fn attribution_not_required_loads_uncredited() {
-        let result =
-            enforce_skill_attribution("s1", "skill://off/SKILL.md", UNCREDITED_SKILL, false).await;
+        let (mgr, _tmp) = manager_with(Arc::new(FakeInterceptor::new())).await;
+        let entry = unsealed_entry("skill://off/SKILL.md");
+        let result = enforce(&mgr, &entry, UNCREDITED_SKILL, false).await;
         assert!(result.is_none());
         let cached = attribution::cached("skill://off/SKILL.md").unwrap();
         assert!(cached.is_non_compliant());
@@ -1675,7 +1745,9 @@ body
 
     #[tokio::test]
     async fn attribution_required_withholds_uncredited() {
-        let result = enforce_skill_attribution("s1", "skill://on/SKILL.md", UNCREDITED_SKILL, true)
+        let (mgr, _tmp) = manager_with(Arc::new(FakeInterceptor::new())).await;
+        let entry = unsealed_entry("skill://on/SKILL.md");
+        let result = enforce(&mgr, &entry, UNCREDITED_SKILL, true)
             .await
             .expect("uncredited skill must be withheld");
         assert!(result.is_error.unwrap_or(false));
@@ -1686,10 +1758,68 @@ body
 
     #[tokio::test]
     async fn attribution_required_loads_partial_and_compliant() {
+        let (mgr, _tmp) = manager_with(Arc::new(FakeInterceptor::new())).await;
+        let entry = unsealed_entry("skill://ok/SKILL.md");
         for skill in [PARTIAL_SKILL, COMPLIANT_SKILL] {
-            let result = enforce_skill_attribution("s1", "skill://ok/SKILL.md", skill, true).await;
+            let result = enforce(&mgr, &entry, skill, true).await;
             assert!(result.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn attribution_required_withholds_when_interceptor_server_is_down() {
+        let fake = Arc::new(FakeInterceptor::new());
+        fake.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (mgr, _tmp) = manager_with(fake).await;
+        let entry = unsealed_entry("skill://down/SKILL.md");
+        assert!(enforce(&mgr, &entry, COMPLIANT_SKILL, false)
+            .await
+            .is_none());
+        let withheld = enforce(&mgr, &entry, COMPLIANT_SKILL, true)
+            .await
+            .expect("an unreachable Interceptor Server withholds in active mode");
+        assert!(text_of(&withheld).contains("could not grade it"));
+    }
+
+    fn sealed_entry() -> McpSkillEntry {
+        let mut entry = unsealed_entry("skill://build-a-rocket/SKILL.md");
+        entry.server = "spaceship-server".to_string();
+        entry.resources =
+            crate::skills::mcp_client::SkillResources::Manifest(vec![SkillResourceRef {
+                uri: entry.uri.clone(),
+                digest: sha256_digest(COMPLIANT_SKILL.as_bytes()),
+                size: COMPLIANT_SKILL.len() as u64,
+            }]);
+        entry.meta =
+            Some(serde_json::json!({ "org.c2pa/credential": "data:application/c2pa;base64,AAAA" }));
+        entry
+    }
+
+    #[tokio::test]
+    async fn sealed_skill_loads_and_tampered_seal_is_withheld_only_when_required() {
+        let fake = Arc::new(FakeInterceptor::new());
+        let (mgr, _tmp) = manager_with(fake.clone()).await;
+        let entry = sealed_entry();
+        assert!(enforce(&mgr, &entry, COMPLIANT_SKILL, true).await.is_none());
+        assert_eq!(attribution::cached(&entry.uri).unwrap().seal, "verified");
+
+        // After a tamper and a server restart the entry's digest changes while
+        // the stale credential rides along: audit mode loads and records the
+        // mismatch, active mode withholds.
+        fake.seal_ok
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(enforce(&mgr, &entry, COMPLIANT_SKILL, false)
+            .await
+            .is_none());
+        assert_eq!(attribution::cached(&entry.uri).unwrap().seal, "mismatch");
+
+        let withheld = enforce(&mgr, &entry, COMPLIANT_SKILL, true)
+            .await
+            .expect("a seal mismatch must be withheld in active mode");
+        assert!(withheld.is_error.unwrap_or(false));
+        let text = text_of(&withheld);
+        assert!(text.contains("seal does not verify"), "got: {}", text);
+        assert!(text.contains("mode: active"), "got: {}", text);
     }
 
     #[tokio::test]

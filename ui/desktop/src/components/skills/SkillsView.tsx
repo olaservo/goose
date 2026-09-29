@@ -68,6 +68,8 @@ interface SkillEntry {
   mcpServer?: string;
   complianceStatus?: string;
   attributionSummary?: string;
+  sealStatus?: string;
+  sealSummary?: string;
 }
 
 function stringProperty(source: SourceEntry, key: string): string | undefined {
@@ -95,8 +97,23 @@ function complianceBadge(status?: string): { label: string; className: string } 
   }
 }
 
+function sealBadge(status?: string): { label: string; className: string } | null {
+  switch (status) {
+    case 'verified':
+      return { label: 'sealed', className: 'bg-green-500/15 text-green-700 dark:text-green-400' };
+    case 'mismatch':
+      return {
+        label: 'seal mismatch',
+        className: 'bg-red-500/15 text-red-700 dark:text-red-400',
+      };
+    default:
+      return null;
+  }
+}
+
 function SkillItem({ skill }: { skill: SkillEntry }) {
   const badge = complianceBadge(skill.complianceStatus);
+  const seal = sealBadge(skill.sealStatus);
   return (
     <Card className="py-2 px-4 mb-2 bg-background-primary border-none hover:bg-background-secondary transition-all duration-150">
       <div className="flex justify-between items-center gap-4">
@@ -114,6 +131,14 @@ function SkillItem({ skill }: { skill: SkillEntry }) {
                 title={skill.complianceStatus}
               >
                 {badge.label}
+              </span>
+            ) : null}
+            {seal ? (
+              <span
+                className={`text-xs px-1.5 py-0.5 rounded ${seal.className}`}
+                title={skill.sealSummary || skill.sealStatus}
+              >
+                {seal.label}
               </span>
             ) : null}
           </div>
@@ -178,6 +203,8 @@ export default function SkillsView() {
         mcpServer: stringProperty(source, 'mcpServer'),
         complianceStatus: stringProperty(source, 'complianceStatus'),
         attributionSummary: stringProperty(source, 'attributionSummary'),
+        sealStatus: stringProperty(source, 'sealStatus'),
+        sealSummary: stringProperty(source, 'sealSummary'),
       }));
       setSkills(skillEntries);
     } catch (err) {

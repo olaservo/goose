@@ -30,6 +30,12 @@ use crate::skills::SkillFrontmatter;
 /// Extension identifier per the SEP.
 pub(crate) const SKILLS_EXTENSION_ID: &str = "io.modelcontextprotocol/skills";
 
+/// Extension identifier an Interceptor Server declares (SEP-2624).
+pub(crate) const INTERCEPTORS_EXTENSION_ID: &str = "io.modelcontextprotocol/interceptors";
+
+/// `_meta` key carrying an entry's detached C2PA credential.
+pub const CREDENTIAL_KEY: &str = "org.c2pa/credential";
+
 /// How long to wait for a server's full `skills/list` enumeration before
 /// giving up. Applied at extension-registration time so a misbehaving server
 /// cannot stall session startup indefinitely. An empty cache on timeout is
@@ -78,6 +84,9 @@ pub struct McpSkillEntry {
     /// The skill's file manifest (including `SKILL.md` itself), or
     /// [`SkillResources::Dynamic`]: unverifiable, reads unrestricted.
     pub resources: SkillResources,
+    /// The entry's `_meta`, verbatim. Not part of the frontmatter identity
+    /// check; the seal check reads `org.c2pa/credential` from it.
+    pub meta: Option<serde_json::Value>,
 }
 
 impl McpSkillEntry {
@@ -100,6 +109,35 @@ impl McpSkillEntry {
             SkillResources::Manifest(refs) => Some(refs),
             SkillResources::Dynamic => None,
         }
+    }
+
+    /// The detached C2PA credential the server attached to this entry, if any.
+    pub fn credential(&self) -> Option<&str> {
+        self.meta.as_ref()?.get(CREDENTIAL_KEY)?.as_str()
+    }
+
+    /// The entry in its wire shape, for handing to an interceptor as the
+    /// `skill` of a `skills/get` result.
+    pub fn wire_json(&self) -> serde_json::Value {
+        let resources = match &self.resources {
+            SkillResources::Manifest(refs) => serde_json::Value::Array(
+                refs.iter()
+                    .map(
+                        |r| serde_json::json!({ "uri": r.uri, "digest": r.digest, "size": r.size }),
+                    )
+                    .collect(),
+            ),
+            SkillResources::Dynamic => serde_json::json!("dynamic"),
+        };
+        let mut entry = serde_json::json!({
+            "uri": self.uri,
+            "frontmatter": self.frontmatter,
+            "resources": resources,
+        });
+        if let Some(meta) = &self.meta {
+            entry["_meta"] = meta.clone();
+        }
+        entry
     }
 
     /// The digest recorded for `uri` in this entry's manifest, if any.
@@ -209,6 +247,15 @@ pub fn server_declares_directory_read(info: &InitializeResult) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if the server declares the interceptors extension, making it
+/// an Interceptor Server the skills gate can invoke.
+pub fn server_declares_interceptors_capability(info: &InitializeResult) -> bool {
+    info.capabilities
+        .extensions
+        .as_ref()
+        .is_some_and(|m| m.contains_key(INTERCEPTORS_EXTENSION_ID))
+}
+
 /// `skills/list` result shape per the SEP. Entries stay as raw JSON so one
 /// malformed entry is skipped in `parse_entry` rather than failing the whole
 /// listing.
@@ -251,6 +298,8 @@ pub struct WireSkillEntry {
     #[serde(default)]
     pub frontmatter: Option<serde_json::Value>,
     pub resources: WireResources,
+    #[serde(default, rename = "_meta")]
+    pub meta: Option<serde_json::Value>,
 }
 
 /// Manifest array or a bare string (`parse_entry` requires `"dynamic"`).
@@ -282,10 +331,7 @@ pub fn verify_digest(expected: &str, bytes: &[u8]) -> Result<(), String> {
             expected
         ));
     };
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let actual = crate::utils::bytes_to_hex(hasher.finalize());
+    let actual = sha256_hex(bytes);
     if actual.eq_ignore_ascii_case(hex_expected.trim()) {
         Ok(())
     } else {
@@ -294,6 +340,18 @@ pub fn verify_digest(expected: &str, bytes: &[u8]) -> Result<(), String> {
             expected, actual
         ))
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    crate::utils::bytes_to_hex(hasher.finalize())
+}
+
+/// `sha256:<hex>` digest of `bytes`, the form skill entries carry.
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    format!("sha256:{}", sha256_hex(bytes))
 }
 
 /// Enumerates a single server's skills via `skills/list`, following
@@ -533,6 +591,7 @@ fn parse_entry(server: &str, raw: serde_json::Value) -> Option<McpSkillEntry> {
         uri,
         frontmatter,
         resources,
+        meta: raw.meta,
     })
 }
 
@@ -718,6 +777,7 @@ mod tests {
                     .into(),
                 size: 5,
             }]),
+            meta: None,
         };
 
         assert!(entry.verify_read(uri, b"hello").is_ok());
@@ -740,6 +800,7 @@ mod tests {
             uri: "skill://s/SKILL.md".into(),
             frontmatter: serde_json::json!({"name": "s", "description": "d", "license": "MIT"}),
             resources: SkillResources::Dynamic,
+            meta: None,
         };
         assert!(entry
             .verify_frontmatter(
@@ -921,6 +982,35 @@ mod tests {
         .await;
         assert_eq!(skills.skills.len(), 1);
         assert_eq!(skills.skills[0].resources, SkillResources::Dynamic);
+    }
+
+    #[tokio::test]
+    async fn test_discover_keeps_entry_meta_and_exposes_credential() {
+        let server = FakeSkillsServer::single_page(serde_json::json!({
+            "skills": [{
+                "uri": "skill://sealed/SKILL.md",
+                "frontmatter": {"name": "sealed", "description": "d"},
+                "resources": [{"uri": "skill://sealed/SKILL.md", "digest": "sha256:00", "size": 1}],
+                "_meta": {"org.c2pa/credential": "data:application/c2pa;base64,AAAA"},
+            }]
+        }));
+        let skills = fetch_server_skills(
+            "srv",
+            &server as &dyn McpClientTrait,
+            "s",
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(skills.skills.len(), 1);
+        assert_eq!(
+            skills.skills[0].credential(),
+            Some("data:application/c2pa;base64,AAAA")
+        );
+        assert_eq!(
+            skills.skills[0].frontmatter,
+            serde_json::json!({"name": "sealed", "description": "d"}),
+            "_meta must not leak into the frontmatter identity check"
+        );
     }
 
     #[tokio::test]

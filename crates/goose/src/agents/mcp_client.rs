@@ -166,6 +166,30 @@ pub trait McpClientTrait: Send + Sync {
         Err(Error::TransportClosed)
     }
 
+    /// List the interceptors an Interceptor Server hosts via
+    /// `interceptors/list` (SEP-2624). Only call against a server that
+    /// declared the `io.modelcontextprotocol/interceptors` extension.
+    async fn interceptors_list(
+        &self,
+        _session_id: &str,
+        _event: Option<String>,
+        _cancel_token: CancellationToken,
+    ) -> Result<Value, Error> {
+        Err(Error::TransportClosed)
+    }
+
+    /// Invoke one interceptor via `interceptor/invoke`. `params` is the SEP's
+    /// params object (`name`, `event`, `phase`, `payload`, `context`); the
+    /// result object comes back as raw JSON.
+    async fn interceptor_invoke(
+        &self,
+        _session_id: &str,
+        _params: Value,
+        _cancel_token: CancellationToken,
+    ) -> Result<Value, Error> {
+        Err(Error::TransportClosed)
+    }
+
     async fn list_prompts(
         &self,
         _session_id: &str,
@@ -834,6 +858,31 @@ impl McpClient {
 
         await_response(handle, self.timeout, &cancel_token).await
     }
+
+    /// Send a custom (extension-defined) request and return its raw result.
+    async fn custom_request(
+        &self,
+        session_id: &str,
+        method: &'static str,
+        params: Value,
+        cancel_token: CancellationToken,
+    ) -> Result<Value, Error> {
+        use rmcp::model::CustomRequest;
+
+        let res = self
+            .send_request_with_context(
+                session_id,
+                None,
+                None,
+                ClientRequest::CustomRequest(CustomRequest::new(method, Some(params))),
+                cancel_token,
+            )
+            .await?;
+        match res {
+            ServerResult::CustomResult(value) => Ok(value.0),
+            _ => Err(ServiceError::UnexpectedResponse),
+        }
+    }
 }
 
 async fn await_response(
@@ -1041,6 +1090,35 @@ impl McpClientTrait for McpClient {
             }
             _ => Err(ServiceError::UnexpectedResponse),
         }
+    }
+
+    async fn interceptors_list(
+        &self,
+        session_id: &str,
+        event: Option<String>,
+        cancel_token: CancellationToken,
+    ) -> Result<Value, Error> {
+        let mut params = serde_json::Map::new();
+        if let Some(event) = event {
+            params.insert("event".to_string(), Value::String(event));
+        }
+        self.custom_request(
+            session_id,
+            "interceptors/list",
+            Value::Object(params),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn interceptor_invoke(
+        &self,
+        session_id: &str,
+        params: Value,
+        cancel_token: CancellationToken,
+    ) -> Result<Value, Error> {
+        self.custom_request(session_id, "interceptor/invoke", params, cancel_token)
+            .await
     }
 
     async fn list_tools(

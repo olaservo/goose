@@ -52,8 +52,12 @@ impl GooseAcpAgent {
                 if !seen.insert((entry.server.clone(), entry.uri.clone())) {
                     continue;
                 }
-                let attribution =
-                    crate::skills::attribution::grade_entry(&entry, &session_id).await;
+                let attribution = crate::skills::attribution::grade_entry(
+                    &agent.extension_manager,
+                    &entry,
+                    &session_id,
+                )
+                .await;
                 let properties = HashMap::from([
                     ("mcpServer".to_string(), serde_json::json!(entry.server)),
                     (
@@ -63,6 +67,14 @@ impl GooseAcpAgent {
                     (
                         "attributionSummary".to_string(),
                         serde_json::json!(attribution.summary),
+                    ),
+                    (
+                        "sealStatus".to_string(),
+                        serde_json::json!(attribution.seal),
+                    ),
+                    (
+                        "sealSummary".to_string(),
+                        serde_json::json!(attribution.seal_summary),
                     ),
                 ]);
                 sources.push(SourceEntry {

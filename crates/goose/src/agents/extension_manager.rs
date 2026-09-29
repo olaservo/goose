@@ -2626,6 +2626,17 @@ impl ExtensionManager {
             .is_some_and(crate::skills::mcp_client::server_declares_skills_capability)
     }
 
+    /// Every connected extension's client, by extension name. The skills
+    /// gate uses this to find the Interceptor Server (SEP-2624).
+    pub async fn extension_clients(&self) -> Vec<(String, McpClientBox)> {
+        self.extensions
+            .lock()
+            .await
+            .iter()
+            .map(|(name, ext)| (name.clone(), ext.client.clone()))
+            .collect()
+    }
+
     /// Retrieve one skill entry by URI from a specific server via
     /// `skills/get` (SEP §Retrieval). Errors as a plain string for the
     /// tool-result path.
